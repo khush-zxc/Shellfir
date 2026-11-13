@@ -1,0 +1,6 @@
+{
+  "name": "Shellfri",
+  "description": "Minimalist Nothing OS-inspired Android launcher that breaks unconscious habits by dynamically randomizing distracted app positions.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
