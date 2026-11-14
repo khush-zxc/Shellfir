@@ -17,6 +17,7 @@ import com.example.domain.model.ShuffleInterval
 import com.example.domain.model.ShuffleStrategy
 import com.example.domain.repository.AppRepository
 import com.example.domain.repository.IconRepository
+import com.example.domain.validation.WidgetPlacement
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -31,6 +32,7 @@ data class HomeUiState(
     val homeApps: List<AppItem> = emptyList(),
     val dockApps: List<AppItem> = emptyList(),
     val folders: List<FolderItem> = emptyList(),
+    val widgets: List<WidgetPlacement> = emptyList(),
     val shuffledApps: List<AppItem> = emptyList(),
     val isShuffleEnabled: Boolean = true,
     val isShufflePaused: Boolean = false,
@@ -107,7 +109,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     private val _isFocusConfigOpen = MutableStateFlow(false)
     private val _isManageShuffledAppsOpen = MutableStateFlow(false)
     private val _isEditMode = MutableStateFlow(false)
-    private val _activeFolder = MutableStateFlow<FolderItem?>(null)
+    private val _activeFolderId = MutableStateFlow<String?>(null)
     private val _selectedAppForConfig = MutableStateFlow<AppItem?>(null)
     private val _isOnboardingOpen = MutableStateFlow(false)
     private val _isShuffleHistoryOpen = MutableStateFlow(false)
@@ -156,14 +158,14 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
                 _isFocusConfigOpen,
                 _isManageShuffledAppsOpen,
                 _isEditMode,
-                _activeFolder,
+                _activeFolderId,
                 _selectedAppForConfig,
                 _isOnboardingOpen,
                 _isShuffleHistoryOpen,
                 _searchQuery
             ) { v -> v }
         ) { values -> values },
-        combine(_messageToast, _isShufflingAnimation) { t, a -> Pair(t, a) }
+        combine(_messageToast, _isShufflingAnimation, repository.widgetsFlow) { t, a, w -> Triple(t, a, w) }
     ) { g1, g2, g3, g4 ->
         @Suppress("UNCHECKED_CAST")
         val allApps = g1[0] as List<AppItem>
@@ -208,7 +210,8 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         val isFocusConfigOpen = uiFlags[2] as Boolean
         val isManageShuffledAppsOpen = uiFlags[3] as Boolean
         val isEditMode = uiFlags[4] as Boolean
-        val activeFolder = uiFlags[5] as FolderItem?
+        val activeFolderId = uiFlags[5] as String?
+        val activeFolder = activeFolderId?.let { id -> folders.find { it.id == id } }
         val selectedApp = uiFlags[6] as AppItem?
         val isOnboardingOpen = uiFlags[7] as Boolean
         val isShuffleHistoryOpen = uiFlags[8] as Boolean
@@ -216,6 +219,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
 
         val toast = g4.first
         val isShuffling = g4.second
+        val widgets = g4.third
 
         val homeApps = allApps.filter { it.isOnHomeScreen && it.folderId == null }
         val dockApps = rawDockApps.take(dockCount)
@@ -227,6 +231,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
             homeApps = homeApps,
             dockApps = dockApps,
             folders = folders,
+            widgets = widgets,
             shuffledApps = shuffledApps,
             isShuffleEnabled = isShuffleEnabled,
             isShufflePaused = isShufflePaused,
@@ -395,6 +400,33 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun moveAppOnHomeScreen(
+        app: AppItem,
+        targetPageIndex: Int,
+        targetSlotIndex: Int,
+        onResult: ((Boolean, String?) -> Unit)? = null
+    ) {
+        viewModelScope.launch {
+            val state = uiState.value
+            val result = repository.moveAppOnHomeScreen(
+                packageName = app.packageName,
+                activityName = app.activityName,
+                targetPageIndex = targetPageIndex,
+                targetSlotIndex = targetSlotIndex,
+                gridColumns = state.gridColumns,
+                preserveEmptySpaces = state.occupancyOption != OccupancyOption.COMPACT_LAYOUT
+            )
+            if (!result.success) {
+                _messageToast.value = result.failureReason ?: "Unable to move ${app.label}"
+            }
+            onResult?.invoke(result.success, result.failureReason)
+        }
+    }
+
+    fun showMessageToast(message: String) {
+        _messageToast.value = message
+    }
+
     fun removeAppFromHomeScreen(app: AppItem) {
         viewModelScope.launch {
             repository.removeAppFromHomeScreen(app.packageName, app.activityName)
@@ -445,47 +477,154 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
 
     fun createFolder(name: String, pageIndex: Int, components: List<Pair<String, String>>) {
         viewModelScope.launch {
-            repository.createFolder(name, pageIndex, 0, components)
-            _messageToast.value = "Folder '$name' created"
+            val distinctComponents = components.distinct()
+            if (distinctComponents.size < 2) {
+                _messageToast.value = "A folder requires at least two apps"
+                return@launch
+            }
+            val safeName = AppRepository.normalizeFolderNameOrDefault(name)
+            runCatching {
+                repository.createFolder(safeName, pageIndex, 0, distinctComponents)
+            }.onSuccess {
+                _messageToast.value = "Folder '$safeName' created"
+            }.onFailure { err ->
+                _messageToast.value = err.message ?: "Unable to create folder"
+            }
         }
     }
 
-    fun renameFolder(folderId: String, newName: String) {
+    fun createFolderFromHomeApps(
+        draggedApp: AppItem,
+        targetApp: AppItem,
+        onResult: ((Boolean, String?) -> Unit)? = null
+    ) {
         viewModelScope.launch {
-            repository.renameFolder(folderId, newName)
-            _activeFolder.value = _activeFolder.value?.copy(name = newName)
-            _messageToast.value = "Folder renamed to '$newName'"
+            val result = repository.createFolderFromHomeApps(
+                draggedPackageName = draggedApp.packageName,
+                draggedActivityName = draggedApp.activityName,
+                targetPackageName = targetApp.packageName,
+                targetActivityName = targetApp.activityName
+            )
+            if (result.success) {
+                _messageToast.value = "Created folder"
+            } else {
+                _messageToast.value = result.failureReason ?: "Unable to create folder"
+            }
+            onResult?.invoke(result.success, result.failureReason)
         }
     }
 
-    fun deleteFolder(folderId: String) {
+    fun moveFolderOnHomeScreen(
+        folder: FolderItem,
+        targetPageIndex: Int,
+        targetSlotIndex: Int,
+        onResult: ((Boolean, String?) -> Unit)? = null
+    ) {
         viewModelScope.launch {
-            repository.deleteFolder(folderId)
-            _activeFolder.value = null
-            _messageToast.value = "Folder deleted. Apps unpacked."
+            val state = uiState.value
+            val result = repository.moveFolderOnHomeScreen(
+                folderId = folder.id,
+                targetPageIndex = targetPageIndex,
+                targetSlotIndex = targetSlotIndex,
+                gridColumns = state.gridColumns,
+                preserveEmptySpaces = state.occupancyOption != OccupancyOption.COMPACT_LAYOUT
+            )
+            if (!result.success) {
+                _messageToast.value = result.failureReason ?: "Unable to move ${folder.name}"
+            }
+            onResult?.invoke(result.success, result.failureReason)
         }
     }
 
-    fun addAppToFolder(app: AppItem, folderId: String) {
+    fun renameFolder(
+        folderId: String,
+        newName: String,
+        onResult: ((Boolean, String?) -> Unit)? = null
+    ) {
         viewModelScope.launch {
-            repository.addAppToFolder(app.packageName, app.activityName, folderId)
-            _messageToast.value = "Added ${app.label} to folder"
+            val result = repository.renameFolderResult(folderId, newName)
+            if (result.success) {
+                _messageToast.value = "Folder renamed to '${newName.trim()}'"
+            } else {
+                _messageToast.value = result.failureReason ?: "Unable to rename folder"
+            }
+            onResult?.invoke(result.success, result.failureReason)
         }
     }
 
-    fun removeAppFromFolder(app: AppItem, targetPage: Int) {
+    fun deleteFolder(
+        folderId: String,
+        onResult: ((Boolean, String?) -> Unit)? = null
+    ) {
         viewModelScope.launch {
-            repository.removeAppFromFolder(app.packageName, app.activityName, targetPage)
-            _messageToast.value = "Removed ${app.label} from folder"
+            val result = repository.deleteFolderResult(folderId)
+            if (result.success) {
+                if (_activeFolderId.value == folderId) {
+                    _activeFolderId.value = null
+                }
+                _messageToast.value = "Folder deleted. Apps unpacked."
+            } else {
+                _messageToast.value = result.failureReason ?: "Unable to delete folder"
+            }
+            onResult?.invoke(result.success, result.failureReason)
+        }
+    }
+
+    fun addAppToFolder(
+        app: AppItem,
+        folderId: String,
+        onResult: ((Boolean, String?) -> Unit)? = null
+    ) {
+        viewModelScope.launch {
+            val result = repository.addAppToFolderResult(app.packageName, app.activityName, folderId)
+            if (result.success) {
+                _messageToast.value = "Added ${app.label} to folder"
+            } else {
+                _messageToast.value = result.failureReason ?: "Unable to add ${app.label} to folder"
+            }
+            onResult?.invoke(result.success, result.failureReason)
+        }
+    }
+
+    fun reorderFolderMembers(
+        folderId: String,
+        orderedApps: List<AppItem>,
+        onResult: ((Boolean, String?) -> Unit)? = null
+    ) {
+        viewModelScope.launch {
+            val result = repository.reorderFolderMembers(
+                folderId = folderId,
+                orderedComponents = orderedApps.map { it.packageName to it.activityName }
+            )
+            if (!result.success) {
+                _messageToast.value = result.failureReason ?: "Unable to reorder folder apps"
+            }
+            onResult?.invoke(result.success, result.failureReason)
+        }
+    }
+
+    fun removeAppFromFolder(
+        app: AppItem,
+        targetPage: Int,
+        onResult: ((Boolean, String?) -> Unit)? = null
+    ) {
+        viewModelScope.launch {
+            val result = repository.removeAppFromFolderResult(app.packageName, app.activityName, targetPage)
+            if (result.success) {
+                _messageToast.value = "Removed ${app.label} from folder"
+            } else {
+                _messageToast.value = result.failureReason ?: "Unable to remove ${app.label} from folder"
+            }
+            onResult?.invoke(result.success, result.failureReason)
         }
     }
 
     fun openFolder(folder: FolderItem) {
-        _activeFolder.value = folder
+        _activeFolderId.value = folder.id
     }
 
     fun closeFolder() {
-        _activeFolder.value = null
+        _activeFolderId.value = null
     }
 
     // --- Focus Mode Configuration ---

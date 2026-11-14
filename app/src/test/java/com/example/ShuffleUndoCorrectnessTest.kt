@@ -236,16 +236,23 @@ class ShuffleUndoCorrectnessTest {
     @Test
     fun `4 app moved into folder after shuffle remains in folder and is skipped safely`() = runBlocking {
         registerLauncherActivity("com.host.app", "com.host.app.Main", "Host")
+        registerLauncherActivity("com.host.app2", "com.host.app2.Main", "Host2")
         registerLauncherActivity("com.shuf.a", "com.shuf.a.Main", "Shuf A")
         registerLauncherActivity("com.shuf.b", "com.shuf.b.Main", "Shuf B")
         repository.discoverAndSyncApps()
         repository.setAppPageAndSlot("com.host.app", "com.host.app.Main", 0, 5)
+        repository.setAppPageAndSlot("com.host.app2", "com.host.app2.Main", 0, 6)
         repository.setAppPageAndSlot("com.shuf.a", "com.shuf.a.Main", 0, 0)
         repository.setAppPageAndSlot("com.shuf.b", "com.shuf.b.Main", 0, 1)
         repository.toggleAppShuffled("com.shuf.a", "com.shuf.a.Main", true)
         repository.toggleAppShuffled("com.shuf.b", "com.shuf.b.Main", true)
 
-        val folderId = repository.createFolder("TargetFolder", 0, 10, listOf("com.host.app" to "com.host.app.Main"))
+        val folderId = repository.createFolder(
+            "TargetFolder",
+            0,
+            10,
+            listOf("com.host.app" to "com.host.app.Main", "com.host.app2" to "com.host.app2.Main")
+        )
 
         // Before shuffle: A@0, B@1. Rotation swaps A->1, B->0
         assertTrue(repository.performShuffle("MANUAL"))
@@ -532,7 +539,7 @@ class ShuffleUndoCorrectnessTest {
 
     @Test
     fun `13 partial undo restores safe components and reports skipped conflicts accurately`() = runBlocking {
-        val pApps = listOf("com.part.a", "com.part.b", "com.part.c", "com.part.d", "com.part.e", "com.part.anchor")
+        val pApps = listOf("com.part.a", "com.part.b", "com.part.c", "com.part.d", "com.part.e", "com.part.anchor", "com.part.anchor2")
         pApps.forEach { registerLauncherActivity(it, "$it.Main", it) }
         repository.discoverAndSyncApps()
         repository.setAppPageAndSlot("com.part.a", "com.part.a.Main", 0, 0)
@@ -541,6 +548,7 @@ class ShuffleUndoCorrectnessTest {
         repository.setAppPageAndSlot("com.part.d", "com.part.d.Main", 0, 11)
         repository.setAppPageAndSlot("com.part.e", "com.part.e.Main", 0, 12)
         repository.setAppPageAndSlot("com.part.anchor", "com.part.anchor.Main", 0, 20)
+        repository.setAppPageAndSlot("com.part.anchor2", "com.part.anchor2.Main", 0, 21)
 
         for (pkg in pApps.take(5)) {
             repository.toggleAppShuffled(pkg, "$pkg.Main", true)
@@ -560,7 +568,10 @@ class ShuffleUndoCorrectnessTest {
             name = "BlockerFolder",
             pageIndex = 0,
             slotIndex = before["com.part.b"]!!,
-            components = listOf("com.part.anchor" to "com.part.anchor.Main")
+            components = listOf(
+                "com.part.anchor" to "com.part.anchor.Main",
+                "com.part.anchor2" to "com.part.anchor2.Main"
+            )
         )
         assertNotNull(fId)
 

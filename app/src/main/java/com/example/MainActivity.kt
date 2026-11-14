@@ -316,7 +316,22 @@ class MainActivity : ComponentActivity() {
                                         onToggleEditMode = { viewModel.setEditMode(it) },
                                         onAddPage = { viewModel.addPage() },
                                         onRemovePage = { viewModel.removePage(it) },
-                                        onSetGridColumns = { viewModel.setGridColumns(it) }
+                                        onSetGridColumns = { viewModel.setGridColumns(it) },
+                                        onMoveApp = { app, targetPage, targetSlot, onResult ->
+                                            viewModel.moveAppOnHomeScreen(app, targetPage, targetSlot, onResult)
+                                        },
+                                        onCreateFolderFromApps = { dragged, target, onResult ->
+                                            viewModel.createFolderFromHomeApps(dragged, target, onResult)
+                                        },
+                                        onAddAppToFolder = { app, folder, onResult ->
+                                            viewModel.addAppToFolder(app, folder.id, onResult)
+                                        },
+                                        onMoveFolder = { folder, targetPage, targetSlot, onResult ->
+                                            viewModel.moveFolderOnHomeScreen(folder, targetPage, targetSlot, onResult)
+                                        },
+                                        onDragRejected = { reason ->
+                                            viewModel.showMessageToast(reason)
+                                        }
                                     )
                                 }
                                 HomeMode.FOCUS -> {
@@ -369,7 +384,15 @@ class MainActivity : ComponentActivity() {
 
                         // Folder Opening Dialog
                         uiState.activeFolder?.let { folder ->
-                            val appsInFolder = uiState.allApps.filter { it.folderId == folder.id }
+                            val appsInFolder = uiState.allApps
+                                .filter { it.folderId == folder.id }
+                                .sortedWith(
+                                    compareBy<com.example.domain.model.AppItem> {
+                                        if (it.folderRank >= 0) it.folderRank else Int.MAX_VALUE
+                                    }
+                                        .thenBy { it.label.lowercase() }
+                                        .thenBy { it.componentKey }
+                                )
                             FolderDialog(
                                 folder = folder,
                                 appsInFolder = appsInFolder,
@@ -378,7 +401,12 @@ class MainActivity : ComponentActivity() {
                                 onAppClick = { viewModel.launchApp(it) },
                                 onRemoveAppFromFolder = { viewModel.removeAppFromFolder(it, folder.pageIndex) },
                                 onAddAppToFolder = { viewModel.addAppToFolder(it, folder.id) },
-                                onRenameFolder = { viewModel.renameFolder(folder.id, it) },
+                                onRenameFolder = { newName, onResult ->
+                                    viewModel.renameFolder(folder.id, newName, onResult)
+                                },
+                                onReorderApps = { reordered, onResult ->
+                                    viewModel.reorderFolderMembers(folder.id, reordered, onResult)
+                                },
                                 onDeleteFolder = { viewModel.deleteFolder(folder.id) },
                                 onDismiss = { viewModel.closeFolder() }
                             )

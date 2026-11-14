@@ -94,6 +94,7 @@ class BackupRestoreHelperTest {
             installedApp("com.alpha", "com.alpha.Main", "Alpha"),
             installedApp("com.alpha", "com.alpha.Camera", "Alpha Cam"),
             installedApp("com.gamma", "com.gamma.Main", "Gamma"),
+            installedApp("com.delta", "com.delta.Main", "Delta"),
             installedApp("com.dock", "com.dock.Main", "Dock")
         )
         db.installedAppDao().upsertApps(apps)
@@ -146,6 +147,12 @@ class BackupRestoreHelperTest {
                     packageName = "com.gamma",
                     activityName = "com.gamma.Main",
                     rank = 0
+                ),
+                FolderMemberEntity(
+                    folderId = "f1",
+                    packageName = "com.delta",
+                    activityName = "com.delta.Main",
+                    rank = 1
                 )
             )
         )
@@ -173,7 +180,7 @@ class BackupRestoreHelperTest {
         assertTrue(previewResult.isSuccess)
         val summary = previewResult.getOrThrow()
         assertEquals(2, summary.version)
-        assertEquals(4, summary.appCount)
+        assertEquals(5, summary.appCount)
         assertEquals(1, summary.folderCount)
         assertEquals("LIGHT", summary.themeMode)
         assertEquals(5, summary.gridColumns)
@@ -226,9 +233,9 @@ class BackupRestoreHelperTest {
         assertNull(dockMain.pageId)
         assertEquals(0, dockMain.rank)
 
-        val members = db.workspaceDao().getFolderMembersList()
-        assertEquals(1, members.size)
-        assertEquals("com.gamma", members.first().packageName)
+        val members = db.workspaceDao().getFolderMembersList().sortedBy { it.rank }
+        assertEquals(2, members.size)
+        assertEquals(listOf("com.gamma", "com.delta"), members.map { it.packageName })
 
         val drawers = db.workspaceDao().getDrawerLayoutsList().associateBy { it.activityName }
         assertTrue(drawers["com.alpha.Main"]!!.isFixed)
@@ -254,6 +261,7 @@ class BackupRestoreHelperTest {
             listOf(
                 installedApp("com.alpha", "com.alpha.Main", "Alpha"),
                 installedApp("com.beta", "com.beta.Main", "Beta"),
+                installedApp("com.gamma", "com.gamma.Main", "Gamma"),
                 installedApp("com.dock", "com.dock.Main", "Dock")
             )
         )
@@ -348,6 +356,25 @@ class BackupRestoreHelperTest {
                     )
                     put(
                         JSONObject().apply {
+                            put("packageName", "com.gamma")
+                            put("activityName", "com.gamma.Main")
+                            put("label", "Gamma")
+                            put("isShuffled", false)
+                            put("isFixed", false)
+                            put("slotIndex", 1)
+                            put("pageIndex", 0)
+                            put("folderId", "f_legacy")
+                            put("isPinnedToDock", false)
+                            put("isOnHomeScreen", false)
+                            put("isVisibleInFocus", false)
+                            put("isEssentialInFocus", false)
+                            put("isHidden", false)
+                            put("drawerSlotIndex", -1)
+                            put("isDrawerShuffled", false)
+                        }
+                    )
+                    put(
+                        JSONObject().apply {
                             put("packageName", "com.dock")
                             put("activityName", "com.dock.Main")
                             put("label", "Dock")
@@ -371,7 +398,7 @@ class BackupRestoreHelperTest {
 
         val summary = helper.parseBackupSummary(v1Json).getOrThrow()
         assertEquals(1, summary.version)
-        assertEquals(3, summary.appCount)
+        assertEquals(4, summary.appCount)
         assertEquals(1, summary.folderCount)
 
         val result = helper.restoreBackup(v1Json)
@@ -391,8 +418,8 @@ class BackupRestoreHelperTest {
         assertNull(dockItem.pageId)
         assertEquals(0, dockItem.rank)
 
-        val members = db.workspaceDao().getFolderMembersList()
-        assertEquals(1, members.size)
+        val members = db.workspaceDao().getFolderMembersList().sortedBy { it.rank }
+        assertEquals(2, members.size)
         assertEquals("f_legacy", members.first().folderId)
         assertEquals("com.beta", members.first().packageName)
         assertTrue(members.first().isFixed)
@@ -473,7 +500,9 @@ class BackupRestoreHelperTest {
     fun `rejects workspace invariant violations and preserves existing DB and preferences`() = runBlocking {
         seedPages(1)
         db.workspaceDao().upsertFolder(FolderEntity(folderId = "orig_f", name = "Orig"))
-        db.installedAppDao().upsertApps(listOf(installedApp("com.one"), installedApp("com.two")))
+        db.installedAppDao().upsertApps(
+            listOf(installedApp("com.one"), installedApp("com.two"), installedApp("com.three"), installedApp("com.four"))
+        )
         db.workspaceDao().upsertWorkspaceItems(
             listOf(
                 WorkspaceItemEntity(
@@ -493,7 +522,21 @@ class BackupRestoreHelperTest {
                     packageName = "com.two",
                     activityName = "com.two.MainActivity",
                     rank = 1
+                ),
+                WorkspaceItemEntity(
+                    itemId = "folder_orig_f",
+                    itemType = WorkspaceItemTypes.FOLDER,
+                    containerType = WorkspaceContainers.HOME,
+                    pageId = "page_0",
+                    folderId = "orig_f",
+                    rank = 2
                 )
+            )
+        )
+        db.workspaceDao().upsertFolderMembers(
+            listOf(
+                FolderMemberEntity("orig_f", "com.three", "com.three.MainActivity", rank = 0),
+                FolderMemberEntity("orig_f", "com.four", "com.four.MainActivity", rank = 1)
             )
         )
         preferences.setGridColumns(4)
@@ -505,8 +548,14 @@ class BackupRestoreHelperTest {
             getJSONObject("preferences").put("gridColumns", 6)
             getJSONObject("preferences").put("themeMode", "LIGHT")
             val items = getJSONArray("workspaceItems")
-            items.getJSONObject(1).put("rank", 0)
+            for (i in 0 until items.length()) {
+                val obj = items.getJSONObject(i)
+                if (obj.optString("itemId") == "home_2") {
+                    obj.put("rank", 0)
+                }
+            }
             put("folders", JSONArray())
+            put("folderMembers", JSONArray())
         }.toString()
 
         val result = helper.restoreBackup(corruptJson)
@@ -527,6 +576,8 @@ class BackupRestoreHelperTest {
         db.installedAppDao().upsertApps(
             listOf(
                 installedApp("com.one"),
+                installedApp("com.two"),
+                installedApp("com.three"),
                 installedApp("com.missing")
             )
         )
@@ -558,6 +609,12 @@ class BackupRestoreHelperTest {
                     folderId = "f1",
                     rank = 1
                 )
+            )
+        )
+        db.workspaceDao().upsertFolderMembers(
+            listOf(
+                FolderMemberEntity("f1", "com.two", "com.two.MainActivity", rank = 0),
+                FolderMemberEntity("f1", "com.three", "com.three.MainActivity", rank = 1)
             )
         )
         preferences.setPageCount(2)

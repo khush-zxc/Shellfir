@@ -45,25 +45,42 @@ fun FolderIconItem(
     onLongClick: () -> Unit = {},
     iconSize: Dp = 54.dp,
     showLabel: Boolean = true,
+    enableBuiltInClick: Boolean = true,
+    isDraggedSource: Boolean = false,
+    isDropTargetArmed: Boolean = false,
+    isDragPreview: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     Column(
         modifier = modifier
-            .combinedClickable(
-                onClick = onClick,
-                onLongClick = onLongClick
+            .then(
+                if (enableBuiltInClick) {
+                    Modifier.combinedClickable(
+                        onClick = onClick,
+                        onLongClick = onLongClick
+                    )
+                } else {
+                    Modifier
+                }
             )
             .padding(vertical = 6.dp, horizontal = 4.dp)
-            .testTag("folder_item_${folder.id}"),
+            .testTag(if (isDragPreview) "folder_drag_preview_item_${folder.id}" else "folder_item_${folder.id}"),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         // Minimal Nothing OS folder preview box
+        val boxAlpha = if (isDraggedSource) 0.25f else 1f
+        val borderColor = if (isDropTargetArmed) {
+            com.example.ui.theme.ShellDarkAccent
+        } else {
+            MaterialTheme.colorScheme.outline
+        }
+        val borderWidth = if (isDropTargetArmed) 2.dp else 1.dp
         Box(
             modifier = Modifier
-                .size(iconSize)
+                .size(if (isDropTargetArmed) iconSize + 4.dp else iconSize)
                 .clip(RoundedCornerShape(16.dp))
-                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f))
-                .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(16.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f * boxAlpha))
+                .border(borderWidth, borderColor, RoundedCornerShape(16.dp))
                 .padding(4.dp),
             contentAlignment = Alignment.Center
         ) {

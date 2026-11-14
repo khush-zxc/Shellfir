@@ -620,6 +620,9 @@ class BackupRestoreHelper(
                 )
             )
 
+            if (v1App.isPinnedToDock) {
+                dockApps.add(resolved to v1App)
+            }
             if (v1App.folderId != null && folders.any { it.folderId == v1App.folderId }) {
                 val mRank = folderMemberRanks.getOrDefault(v1App.folderId, 0)
                 folderMemberRanks[v1App.folderId] = mRank + 1
@@ -633,28 +636,23 @@ class BackupRestoreHelper(
                         isShuffled = v1App.isShuffled && !v1App.isFixed
                     )
                 )
-            } else {
-                if (v1App.isPinnedToDock) {
-                    dockApps.add(resolved to v1App)
-                }
-                if (v1App.isOnHomeScreen && !v1App.isPinnedToDock) {
-                    val pageId = pageIdByIndex[v1App.pageIndex.coerceIn(0, pageCount - 1)] ?: pages.first().pageId
-                    val rank = allocateHomeRank(pageId, v1App.slotIndex)
-                    items.add(
-                        WorkspaceItemEntity(
-                            itemId = "home_${resolved.packageName}_${resolved.activityName}",
-                            itemType = WorkspaceItemTypes.APP,
-                            containerType = WorkspaceContainers.HOME,
-                            pageId = pageId,
-                            packageName = resolved.packageName,
-                            activityName = resolved.activityName,
-                            rank = rank,
-                            isFixed = v1App.isFixed,
-                            isShuffled = v1App.isShuffled && !v1App.isFixed,
-                            isHidden = v1App.isHidden
-                        )
+            } else if (v1App.isOnHomeScreen && !v1App.isPinnedToDock) {
+                val pageId = pageIdByIndex[v1App.pageIndex.coerceIn(0, pageCount - 1)] ?: pages.first().pageId
+                val rank = allocateHomeRank(pageId, v1App.slotIndex)
+                items.add(
+                    WorkspaceItemEntity(
+                        itemId = "home_${resolved.packageName}_${resolved.activityName}",
+                        itemType = WorkspaceItemTypes.APP,
+                        containerType = WorkspaceContainers.HOME,
+                        pageId = pageId,
+                        packageName = resolved.packageName,
+                        activityName = resolved.activityName,
+                        rank = rank,
+                        isFixed = v1App.isFixed,
+                        isShuffled = v1App.isShuffled && !v1App.isFixed,
+                        isHidden = v1App.isHidden
                     )
-                }
+                )
             }
         }
 
@@ -677,6 +675,64 @@ class BackupRestoreHelper(
                 )
             }
 
+        val reconciledV1Folders = folders.toMutableList()
+        val reconciledV1Members = members.toMutableList()
+        val reconciledV1Items = items.toMutableList()
+        for (fId in folders.map { it.folderId }.sorted()) {
+            val remaining = reconciledV1Members
+                .filter { it.folderId == fId }
+                .sortedWith(compareBy<FolderMemberEntity> { it.rank }.thenBy { it.packageName }.thenBy { it.activityName })
+            if (remaining.size >= 2) {
+                reconciledV1Members.removeAll { it.folderId == fId }
+                reconciledV1Members.addAll(remaining.mapIndexed { idx, m -> m.copy(rank = idx) })
+            } else {
+                val folderHomeItem = reconciledV1Items.firstOrNull {
+                    it.itemType == WorkspaceItemTypes.FOLDER && it.folderId == fId
+                }
+                if (folderHomeItem != null && folderHomeItem.pageId != null) {
+                    occupiedHomeByPageId[folderHomeItem.pageId]?.remove(folderHomeItem.rank)
+                }
+                reconciledV1Items.removeAll { it.itemType == WorkspaceItemTypes.FOLDER && it.folderId == fId }
+                reconciledV1Folders.removeAll { it.folderId == fId }
+                reconciledV1Members.removeAll { it.folderId == fId }
+                val survivor = remaining.singleOrNull()
+                if (survivor != null) {
+                    val alreadyOnHome = reconciledV1Items.any {
+                        it.containerType == WorkspaceContainers.HOME &&
+                            it.packageName == survivor.packageName &&
+                            it.activityName == survivor.activityName
+                    }
+                    if (!alreadyOnHome) {
+                        val targetPageId = folderHomeItem?.pageId ?: pages.first().pageId
+                        val rank = allocateHomeRank(targetPageId, folderHomeItem?.rank ?: 0)
+                        val dockHidden = reconciledV1Items.firstOrNull {
+                            it.containerType == WorkspaceContainers.DOCK &&
+                                it.packageName == survivor.packageName &&
+                                it.activityName == survivor.activityName
+                        }?.isHidden
+                        val drawerHidden = drawers.firstOrNull {
+                            it.packageName == survivor.packageName &&
+                                it.activityName == survivor.activityName
+                        }?.isHidden
+                        reconciledV1Items.add(
+                            WorkspaceItemEntity(
+                                itemId = "home_${survivor.packageName}_${survivor.activityName}",
+                                itemType = WorkspaceItemTypes.APP,
+                                containerType = WorkspaceContainers.HOME,
+                                pageId = targetPageId,
+                                packageName = survivor.packageName,
+                                activityName = survivor.activityName,
+                                rank = rank,
+                                isFixed = survivor.isFixed,
+                                isShuffled = !survivor.isFixed && survivor.isShuffled,
+                                isHidden = dockHidden ?: drawerHidden ?: false
+                            )
+                        )
+                    }
+                }
+            }
+        }
+
         // Reconcile device-installed apps not present in v1 backup
         val prevHomeByComp = previousItems
             .filter { it.containerType == WorkspaceContainers.HOME && it.itemType == WorkspaceItemTypes.APP && it.packageName != null }
@@ -691,7 +747,7 @@ class BackupRestoreHelper(
             if (prevHome != null) {
                 val pageId = pages.first().pageId
                 val safeRank = allocateHomeRank(pageId, prevHome.rank)
-                items.add(
+                reconciledV1Items.add(
                     prevHome.copy(
                         pageId = pageId,
                         rank = safeRank
@@ -702,9 +758,9 @@ class BackupRestoreHelper(
 
         return RestoredWorkspaceBundle(
             pages = pages,
-            folders = folders,
-            workspaceItems = items,
-            folderMembers = members,
+            folders = reconciledV1Folders,
+            workspaceItems = reconciledV1Items,
+            folderMembers = reconciledV1Members,
             drawerLayout = drawers,
             focusApps = focusList,
             skippedUninstalledComponents = skippedUninstalled
@@ -720,8 +776,8 @@ class BackupRestoreHelper(
     ): RestoredWorkspaceBundle {
         val installedSet = installedApps.map { it.packageName to it.activityName }.toSet()
         val pages = payload.pages.sortedBy { it.pageIndex }
-        val folders = payload.folders
-        val validFolderIds = folders.map { it.folderId }.toSet()
+        val mutableFolders = payload.folders.toMutableList()
+        val validFolderIds = mutableFolders.map { it.folderId }.toSet()
 
         val restoredItems = mutableListOf<WorkspaceItemEntity>()
         val backedComponents = mutableSetOf<Pair<String, String>>()
@@ -768,7 +824,7 @@ class BackupRestoreHelper(
                 skippedUninstalledComps.add(comp)
             }
             keep
-        }
+        }.toMutableList()
 
         val restoredDrawers = payload.drawerLayout.filter { (it.packageName to it.activityName) in installedSet }.toMutableList()
         val drawerBackedSet = restoredDrawers.map { it.packageName to it.activityName }.toSet()
@@ -792,6 +848,66 @@ class BackupRestoreHelper(
             while (candidate in occupied) candidate++
             occupied.add(candidate)
             return candidate
+        }
+
+        // Normalize all restored folders before commit:
+        // - >= 2 installed members: retain folder & repack contiguous ranks 0..N-1
+        // - 1 installed member: dissolve folder and restore survivor onto HOME (preserving Dock)
+        // - 0 installed members: remove folder and its HOME placement
+        for (fId in payload.folders.map { it.folderId }.sorted()) {
+            val remaining = restoredMembers
+                .filter { it.folderId == fId }
+                .sortedWith(compareBy<FolderMemberEntity> { it.rank }.thenBy { it.packageName }.thenBy { it.activityName })
+            if (remaining.size >= 2) {
+                restoredMembers.removeAll { it.folderId == fId }
+                restoredMembers.addAll(remaining.mapIndexed { idx, m -> m.copy(rank = idx) })
+            } else {
+                val folderHomeItem = nonDockItems.firstOrNull {
+                    it.itemType == WorkspaceItemTypes.FOLDER && it.folderId == fId
+                }
+                if (folderHomeItem != null && folderHomeItem.pageId != null) {
+                    occupiedHomeByPageId[folderHomeItem.pageId]?.remove(folderHomeItem.rank)
+                }
+                nonDockItems.removeAll { it.itemType == WorkspaceItemTypes.FOLDER && it.folderId == fId }
+                mutableFolders.removeAll { it.folderId == fId }
+                restoredMembers.removeAll { it.folderId == fId }
+
+                val survivor = remaining.singleOrNull()
+                if (survivor != null) {
+                    val alreadyOnHome = nonDockItems.any {
+                        it.containerType == WorkspaceContainers.HOME &&
+                            it.packageName == survivor.packageName &&
+                            it.activityName == survivor.activityName
+                    }
+                    if (!alreadyOnHome) {
+                        val targetPageId = folderHomeItem?.pageId?.takeIf { it in validPageIds } ?: fallbackPageId
+                        val rank = allocateHomeRank(targetPageId, folderHomeItem?.rank ?: 0)
+                        val dockHidden = nonDockItems.firstOrNull {
+                            it.containerType == WorkspaceContainers.DOCK &&
+                                it.packageName == survivor.packageName &&
+                                it.activityName == survivor.activityName
+                        }?.isHidden
+                        val drawerHidden = restoredDrawers.firstOrNull {
+                            it.packageName == survivor.packageName &&
+                                it.activityName == survivor.activityName
+                        }?.isHidden
+                        nonDockItems.add(
+                            WorkspaceItemEntity(
+                                itemId = "home_${survivor.packageName}_${survivor.activityName}",
+                                itemType = WorkspaceItemTypes.APP,
+                                containerType = WorkspaceContainers.HOME,
+                                pageId = targetPageId,
+                                packageName = survivor.packageName,
+                                activityName = survivor.activityName,
+                                rank = rank,
+                                isFixed = survivor.isFixed,
+                                isShuffled = !survivor.isFixed && survivor.isShuffled,
+                                isHidden = dockHidden ?: drawerHidden ?: false
+                            )
+                        )
+                    }
+                }
+            }
         }
 
         for (extra in installedApps) {
@@ -823,7 +939,7 @@ class BackupRestoreHelper(
 
         return RestoredWorkspaceBundle(
             pages = pages,
-            folders = folders,
+            folders = mutableFolders,
             workspaceItems = nonDockItems,
             folderMembers = restoredMembers,
             drawerLayout = restoredDrawers,
@@ -991,6 +1107,15 @@ class BackupRestoreHelper(
                 }
                 WorkspaceItemTypes.FOLDER -> {
                     val fId = item.folderId
+                    require(item.containerType == WorkspaceContainers.HOME) {
+                        "FOLDER item ${item.itemId} must be placed in HOME container"
+                    }
+                    require(item.columnSpan == 1 && item.rowSpan == 1) {
+                        "FOLDER item ${item.itemId} must have 1x1 span"
+                    }
+                    require(item.packageName == null && item.activityName == null && item.appWidgetId == null) {
+                        "FOLDER item ${item.itemId} must not reference app component or widget"
+                    }
                     require(!fId.isNullOrBlank() && fId in folderIds) {
                         "FOLDER item ${item.itemId} references missing folderId=$fId"
                     }
@@ -1008,10 +1133,14 @@ class BackupRestoreHelper(
         }
 
         val memberRanks = mutableMapOf<String, MutableSet<Int>>()
+        val seenMemberComponents = mutableSetOf<Pair<String, String>>()
         for (member in members) {
             require(member.folderId in folderIds) { "FolderMember references missing folderId=${member.folderId}" }
             require(member.rank >= 0) { "FolderMember has negative rank ${member.rank}" }
             val comp = member.packageName to member.activityName
+            require(seenMemberComponents.add(comp)) {
+                "Component ${member.packageName}/${member.activityName} cannot belong to multiple folders"
+            }
             require(comp !in homeComponents) {
                 "Component ${member.packageName}/${member.activityName} cannot be both in folder ${member.folderId} and on HOME"
             }

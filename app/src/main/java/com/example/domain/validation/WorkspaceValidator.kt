@@ -144,6 +144,7 @@ class WorkspaceValidator {
 
         val occupiedByApps = mutableSetOf<Pair<Int, Int>>()
         val occupiedDrawerSlots = mutableSetOf<Int>()
+        val occupiedFolderRanks = mutableMapOf<String, MutableSet<Int>>()
 
         for (app in apps) {
             val fId = app.folderId
@@ -153,6 +154,12 @@ class WorkspaceValidator {
                 }
                 if (app.isOnHomeScreen) {
                     errors.add("App ${app.componentKey} cannot be directly on home screen while inside folder $fId")
+                }
+                if (app.folderRank >= 0) {
+                    val ranks = occupiedFolderRanks.getOrPut(fId) { mutableSetOf() }
+                    if (!ranks.add(app.folderRank)) {
+                        errors.add("Duplicate folderRank ${app.folderRank} in folder $fId at ${app.componentKey}")
+                    }
                 }
             }
 
@@ -206,7 +213,9 @@ class WorkspaceValidator {
         drawerLayouts: List<DrawerLayoutEntity>,
         focusApps: List<FocusAppEntity> = emptyList(),
         dockCount: Int = 5,
-        drawerShuffleEnabled: Boolean = false
+        drawerShuffleEnabled: Boolean = false,
+        minFolderMembers: Int = 2,
+        requirePlacedFolders: Boolean = true
     ): WorkspaceValidationResult {
         val errors = mutableListOf<String>()
 
@@ -248,12 +257,15 @@ class WorkspaceValidator {
             }
         }
 
-        // Folders uniqueness
+        // Folders uniqueness and valid names
         val folderIds = mutableSetOf<String>()
         for (folder in folders) {
             if (folder.folderId.isBlank()) {
                 errors.add("Folder has blank folderId")
                 continue
+            }
+            if (folder.name.isBlank()) {
+                errors.add("Folder ${folder.folderId} has blank name")
             }
             if (!folderIds.add(folder.folderId)) {
                 errors.add("Duplicate folderId: ${folder.folderId}")
@@ -340,6 +352,15 @@ class WorkspaceValidator {
 
                 WorkspaceItemTypes.FOLDER -> {
                     val fId = item.folderId
+                    if (item.containerType != WorkspaceContainers.HOME) {
+                        errors.add("FOLDER item ${item.itemId} must be placed in HOME container, found ${item.containerType}")
+                    }
+                    if (item.columnSpan != 1 || item.rowSpan != 1) {
+                        errors.add("FOLDER item ${item.itemId} must have 1x1 span, found ${item.columnSpan}x${item.rowSpan}")
+                    }
+                    if (item.packageName != null || item.activityName != null || item.appWidgetId != null) {
+                        errors.add("FOLDER item ${item.itemId} must not reference app component or widget")
+                    }
                     if (fId.isNullOrBlank() || fId !in folderIds) {
                         errors.add("FOLDER item ${item.itemId} references missing folderId=$fId")
                     } else if (!placedFolderIds.add(fId)) {
@@ -363,13 +384,23 @@ class WorkspaceValidator {
             }
         }
 
+        if (requirePlacedFolders) {
+            for (fId in folderIds) {
+                if (fId !in placedFolderIds) {
+                    errors.add("Folder $fId has no HOME workspace placement")
+                }
+            }
+        }
+
         if (dockItemCount > dockCount) {
             errors.add("DOCK item count $dockItemCount exceeds dockCount $dockCount")
         }
 
         // Folder members integrity
         val seenMemberKeys = mutableSetOf<Triple<String, String, String>>()
+        val seenMemberComponents = mutableSetOf<Pair<String, String>>()
         val memberRanksByFolder = mutableMapOf<String, MutableSet<Int>>()
+        val installedMemberCountByFolder = mutableMapOf<String, Int>()
         for (member in folderMembers) {
             if (member.folderId !in folderIds) {
                 errors.add("FolderMember references missing folderId=${member.folderId}")
@@ -379,9 +410,15 @@ class WorkspaceValidator {
                 errors.add("Duplicate FolderMember $key")
             }
             val comp = member.packageName to member.activityName
+            if (!seenMemberComponents.add(comp)) {
+                errors.add("Component ${member.packageName}/${member.activityName} belongs to multiple folders")
+            }
             val installed = installedByComponent[comp]
             if (installed == null || !installed.isInstalled) {
                 errors.add("FolderMember references uninstalled or missing component ${member.packageName}/${member.activityName}")
+            } else if (member.folderId in folderIds) {
+                installedMemberCountByFolder[member.folderId] =
+                    (installedMemberCountByFolder[member.folderId] ?: 0) + 1
             }
             if (comp in activeHomeAppComponents) {
                 errors.add("Component ${member.packageName}/${member.activityName} cannot be in folder ${member.folderId} while placed directly on HOME")
@@ -392,6 +429,22 @@ class WorkspaceValidator {
                 val ranks = memberRanksByFolder.getOrPut(member.folderId) { mutableSetOf() }
                 if (!ranks.add(member.rank)) {
                     errors.add("Duplicate rank ${member.rank} in folder ${member.folderId}")
+                }
+            }
+        }
+
+        for ((fId, ranks) in memberRanksByFolder) {
+            val expectedRanks = (0 until ranks.size).toSet()
+            if (ranks != expectedRanks) {
+                errors.add("Folder $fId has non-contiguous member ranks $ranks (expected 0..${ranks.size - 1})")
+            }
+        }
+
+        if (minFolderMembers > 0) {
+            for (fId in folderIds) {
+                val count = installedMemberCountByFolder[fId] ?: 0
+                if (count < minFolderMembers) {
+                    errors.add("Folder $fId has $count member(s); minimum required is $minFolderMembers")
                 }
             }
         }

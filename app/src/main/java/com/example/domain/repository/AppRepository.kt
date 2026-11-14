@@ -37,6 +37,9 @@ import com.example.domain.shuffle.ShuffleEngine
 import com.example.domain.shuffle.ShuffleRequest
 import com.example.domain.shuffle.UndoShuffleResult
 import com.example.domain.shuffle.UndoShuffleStatus
+import com.example.domain.placement.FolderMoveRequest
+import com.example.domain.placement.PlacementMoveRequest
+import com.example.domain.placement.WorkspacePlacementPlanner
 import com.example.domain.validation.WidgetPlacement
 import com.example.domain.validation.WorkspaceValidator
 import kotlinx.coroutines.CancellationException
@@ -67,6 +70,19 @@ class AppRepository(
 ) {
     private val packageManager: PackageManager = context.packageManager
     private val recentShufflePositions = mutableMapOf<String, ArrayDeque<Pair<Int, Int>>>()
+    private val placementPlanner = WorkspacePlacementPlanner(workspaceValidator)
+
+    data class MoveWorkspaceAppResult(
+        val success: Boolean,
+        val failureReason: String? = null,
+        val movedCount: Int = 0
+    )
+
+    data class FolderMutationResult(
+        val success: Boolean,
+        val folderId: String? = null,
+        val failureReason: String? = null
+    )
 
     private data class PackageDiscoverySnapshot(
         val discovered: List<AppItem>,
@@ -177,12 +193,14 @@ class AppRepository(
         val syncPrefPageCount: Int? = mutationCoordinator.withMutationLock {
             val prefPageCount = preferences.pageCountFlow.first().coerceAtLeast(1)
             val maxDockCount = preferences.dockCountFlow.first().coerceIn(3, 7)
+            val drawerShuffleEnabled = preferences.drawerShuffleEnabledFlow.first()
 
             runInTransaction {
                 reconcileDiscoveredAppsInTransaction(
                     snapshot = discoverySnapshot,
                     prefPageCount = prefPageCount,
-                    maxDockCount = maxDockCount
+                    maxDockCount = maxDockCount,
+                    drawerShuffleEnabled = drawerShuffleEnabled
                 )
             }?.also { newPageCount ->
                 preferences.setPageCount(newPageCount)
@@ -278,7 +296,8 @@ class AppRepository(
     private suspend fun reconcileDiscoveredAppsInTransaction(
         snapshot: PackageDiscoverySnapshot,
         prefPageCount: Int,
-        maxDockCount: Int
+        maxDockCount: Int,
+        drawerShuffleEnabled: Boolean
     ): Int? {
         val discovered = snapshot.discovered
         val defaultDistractionPackages = setOf(
@@ -302,7 +321,7 @@ class AppRepository(
         val existingDrawers = workspaceDao.getDrawerLayoutsList().associateBy { it.packageName to it.activityName }.toMutableMap()
         val existingFocus = workspaceDao.getFocusAppsList().associateBy { it.packageName to it.activityName }.toMutableMap()
 
-        val validFolderIds = existingFolders.map { it.folderId }.toSet()
+        val validFolderIds = existingFolders.map { it.folderId }.toMutableSet()
         val validPageIds = existingPages.map { it.pageId }.toSet()
         val existingByComponent = existingInstalled.associateBy { it.packageName to it.activityName }
         val discoveredSet = discovered.map { it.packageName to it.activityName }.toSet()
@@ -336,6 +355,7 @@ class AppRepository(
         val itemsToDelete = mutableListOf<String>()
         val membersToUpsert = mutableListOf<FolderMemberEntity>()
         val membersToDelete = mutableListOf<FolderMemberEntity>()
+        val foldersToDelete = mutableSetOf<String>()
         val drawersToUpsert = mutableListOf<DrawerLayoutEntity>()
         val focusToUpsert = mutableListOf<FocusAppEntity>()
 
@@ -375,6 +395,12 @@ class AppRepository(
             return candidate
         }
 
+        // Snapshot folder Home placements prior to Step 1 uninstall modifications
+        val preUninstallFolderHomeById = existingItems
+            .filter { it.itemType == WorkspaceItemTypes.FOLDER && it.folderId != null }
+            .associateBy { it.folderId!! }
+        val affectedFolderIdsAfterUninstall = mutableSetOf<String>()
+
         // 1. Handle uninstalled components: archive active placement & strip invalid active references.
         // Skip legacy blank-activity records being reconciled directly in Step 2A.
         for (record in existingInstalled) {
@@ -383,9 +409,10 @@ class AppRepository(
             if (comp !in discoveredSet) {
                 val activeItems = existingItems.filter { it.packageName == record.packageName && it.activityName == record.activityName }
                 val activeMember = existingMembers.find { it.packageName == record.packageName && it.activityName == record.activityName }
+                val activeFolderHome = activeMember?.folderId?.let { preUninstallFolderHomeById[it] }
 
                 val archivedJson = if (record.isInstalled && (activeItems.isNotEmpty() || activeMember != null)) {
-                    serializeArchivedPlacement(activeItems, activeMember, pageIdToIndex)
+                    serializeArchivedPlacement(activeItems, activeMember, pageIdToIndex, activeFolderHome)
                 } else {
                     record.archivedPlacementJson
                 }
@@ -412,6 +439,84 @@ class AppRepository(
                 if (activeMember != null) {
                     membersToDelete.add(activeMember)
                     existingMembers.remove(activeMember)
+                    affectedFolderIdsAfterUninstall.add(activeMember.folderId)
+                }
+            }
+        }
+
+        // 1B. Reconcile folders affected by member uninstall before Step 2A reinstall restoration:
+        // - >= 2 remaining: repack contiguous ranks 0..N-1
+        // - 1 remaining: dissolve folder and unpack survivor to folder's Home slot (preserving Dock)
+        // - 0 remaining: delete empty folder & its Home item
+        for (fId in affectedFolderIdsAfterUninstall.sorted()) {
+            val remaining = existingMembers
+                .filter { it.folderId == fId }
+                .sortedWith(compareBy<FolderMemberEntity> { it.rank }.thenBy { it.packageName }.thenBy { it.activityName })
+            if (remaining.size >= 2) {
+                val repacked = remaining.mapIndexed { idx, m -> m.copy(rank = idx) }
+                existingMembers.removeAll { it.folderId == fId }
+                existingMembers.addAll(repacked)
+                membersToUpsert.addAll(repacked)
+            } else {
+                validFolderIds.remove(fId)
+                foldersToDelete.add(fId)
+                val folderHomeItem = existingItems.firstOrNull {
+                    it.itemType == WorkspaceItemTypes.FOLDER && it.folderId == fId
+                }
+                if (folderHomeItem != null) {
+                    itemsToDelete.add(folderHomeItem.itemId)
+                    if (folderHomeItem.containerType == WorkspaceContainers.HOME && folderHomeItem.pageId != null) {
+                        val span = (folderHomeItem.columnSpan.coerceAtLeast(1) * folderHomeItem.rowSpan.coerceAtLeast(1))
+                        for (offset in 0 until span) occupiedHomeByPageId[folderHomeItem.pageId]?.remove(folderHomeItem.rank + offset)
+                    }
+                    existingItems.removeAll { it.itemId == folderHomeItem.itemId }
+                }
+
+                val survivor = remaining.singleOrNull()
+                if (survivor != null) {
+                    membersToDelete.add(survivor)
+                    existingMembers.remove(survivor)
+
+                    val staleSurvivorHome = existingItems.filter {
+                        it.containerType == WorkspaceContainers.HOME &&
+                            it.packageName == survivor.packageName &&
+                            it.activityName == survivor.activityName
+                    }
+                    for (stale in staleSurvivorHome) {
+                        itemsToDelete.add(stale.itemId)
+                        if (stale.pageId != null) {
+                            occupiedHomeByPageId[stale.pageId]?.remove(stale.rank)
+                        }
+                    }
+                    existingItems.removeAll {
+                        it.containerType == WorkspaceContainers.HOME &&
+                            it.packageName == survivor.packageName &&
+                            it.activityName == survivor.activityName
+                    }
+
+                    val targetPageId = folderHomeItem?.pageId?.takeIf { it in validPageIds } ?: page0Id
+                    val preferredRank = folderHomeItem?.rank ?: 0
+                    val restoredRank = allocateHomeRank(targetPageId, preferredRank)
+                    val dockHidden = existingItems.firstOrNull {
+                        it.containerType == WorkspaceContainers.DOCK &&
+                            it.packageName == survivor.packageName &&
+                            it.activityName == survivor.activityName
+                    }?.isHidden ?: false
+
+                    val restoredHome = WorkspaceItemEntity(
+                        itemId = homeItemId(survivor.packageName, survivor.activityName),
+                        itemType = WorkspaceItemTypes.APP,
+                        containerType = WorkspaceContainers.HOME,
+                        pageId = targetPageId,
+                        packageName = survivor.packageName,
+                        activityName = survivor.activityName,
+                        rank = restoredRank,
+                        isFixed = survivor.isFixed,
+                        isShuffled = !survivor.isFixed && survivor.isShuffled,
+                        isHidden = dockHidden
+                    )
+                    itemsToUpsert.add(restoredHome)
+                    existingItems.add(restoredHome)
                 }
             }
         }
@@ -436,6 +541,7 @@ class AppRepository(
                         act = item.activityName,
                         pages = existingPages,
                         validFolderIds = validFolderIds,
+                        existingItems = existingItems,
                         existingMembers = existingMembers,
                         currentDockSize = currentDockSize,
                         maxDockCount = maxDockCount,
@@ -481,6 +587,7 @@ class AppRepository(
                         act = item.activityName,
                         pages = existingPages,
                         validFolderIds = validFolderIds,
+                        existingItems = existingItems,
                         existingMembers = existingMembers,
                         currentDockSize = currentDockSize,
                         maxDockCount = maxDockCount,
@@ -631,6 +738,85 @@ class AppRepository(
             }
         }
 
+        // 2A-post. Normalize any remaining pre-existing/migrated folders with < 2 members so committed DB adheres to strict invariant.
+        for (fId in validFolderIds.toList().sorted()) {
+            val remaining = existingMembers
+                .filter { it.folderId == fId }
+                .sortedWith(compareBy<FolderMemberEntity> { it.rank }.thenBy { it.packageName }.thenBy { it.activityName })
+            if (remaining.size >= 2) {
+                val needsRepack = remaining.withIndex().any { (idx, m) -> m.rank != idx }
+                if (needsRepack) {
+                    val repacked = remaining.mapIndexed { idx, m -> m.copy(rank = idx) }
+                    existingMembers.removeAll { it.folderId == fId }
+                    existingMembers.addAll(repacked)
+                    membersToUpsert.removeAll { it.folderId == fId }
+                    membersToUpsert.addAll(repacked)
+                }
+            } else {
+                validFolderIds.remove(fId)
+                foldersToDelete.add(fId)
+                val folderHomeItem = existingItems.firstOrNull {
+                    it.itemType == WorkspaceItemTypes.FOLDER && it.folderId == fId
+                }
+                if (folderHomeItem != null) {
+                    itemsToDelete.add(folderHomeItem.itemId)
+                    if (folderHomeItem.containerType == WorkspaceContainers.HOME && folderHomeItem.pageId != null) {
+                        val span = (folderHomeItem.columnSpan.coerceAtLeast(1) * folderHomeItem.rowSpan.coerceAtLeast(1))
+                        for (offset in 0 until span) occupiedHomeByPageId[folderHomeItem.pageId]?.remove(folderHomeItem.rank + offset)
+                    }
+                    existingItems.removeAll { it.itemId == folderHomeItem.itemId }
+                }
+
+                val survivor = remaining.singleOrNull()
+                if (survivor != null) {
+                    membersToDelete.add(survivor)
+                    membersToUpsert.removeAll { it.folderId == fId }
+                    existingMembers.remove(survivor)
+
+                    val staleSurvivorHome = existingItems.filter {
+                        it.containerType == WorkspaceContainers.HOME &&
+                            it.packageName == survivor.packageName &&
+                            it.activityName == survivor.activityName
+                    }
+                    for (stale in staleSurvivorHome) {
+                        itemsToDelete.add(stale.itemId)
+                        if (stale.pageId != null) {
+                            occupiedHomeByPageId[stale.pageId]?.remove(stale.rank)
+                        }
+                    }
+                    existingItems.removeAll {
+                        it.containerType == WorkspaceContainers.HOME &&
+                            it.packageName == survivor.packageName &&
+                            it.activityName == survivor.activityName
+                    }
+
+                    val targetPageId = folderHomeItem?.pageId?.takeIf { it in validPageIds } ?: page0Id
+                    val preferredRank = folderHomeItem?.rank ?: 0
+                    val restoredRank = allocateHomeRank(targetPageId, preferredRank)
+                    val dockHidden = existingItems.firstOrNull {
+                        it.containerType == WorkspaceContainers.DOCK &&
+                            it.packageName == survivor.packageName &&
+                            it.activityName == survivor.activityName
+                    }?.isHidden ?: false
+
+                    val restoredHome = WorkspaceItemEntity(
+                        itemId = homeItemId(survivor.packageName, survivor.activityName),
+                        itemType = WorkspaceItemTypes.APP,
+                        containerType = WorkspaceContainers.HOME,
+                        pageId = targetPageId,
+                        packageName = survivor.packageName,
+                        activityName = survivor.activityName,
+                        rank = restoredRank,
+                        isFixed = survivor.isFixed,
+                        isShuffled = !survivor.isFixed && survivor.isShuffled,
+                        isHidden = dockHidden
+                    )
+                    itemsToUpsert.add(restoredHome)
+                    existingItems.add(restoredHome)
+                }
+            }
+        }
+
         // 2B. Handle brand-new components
         for (item in brandNewCandidates) {
             val isDefaultDistraction = defaultDistractionPackages.contains(item.packageName) ||
@@ -728,6 +914,11 @@ class AppRepository(
         for (member in membersToDelete) {
             workspaceDao.deleteFolderMember(member.folderId, member.packageName, member.activityName)
         }
+        for (folderId in foldersToDelete) {
+            workspaceDao.deleteWorkspaceItemsForFolder(folderId)
+            workspaceDao.deleteFolderMembersByFolder(folderId)
+            workspaceDao.deleteFolder(folderId)
+        }
         if (updatedApps.isNotEmpty()) installedAppDao.upsertApps(updatedApps)
         if (itemsToUpsert.isNotEmpty()) workspaceDao.upsertWorkspaceItems(itemsToUpsert)
         if (membersToUpsert.isNotEmpty()) workspaceDao.upsertFolderMembers(membersToUpsert)
@@ -751,6 +942,7 @@ class AppRepository(
             installedAppDao.deleteByComponent(pkg, act)
         }
 
+        validateNormalizedDbStateOrThrow(maxDockCount, drawerShuffleEnabled)
         return if (existingPages.size != prefPageCount) existingPages.size else null
     }
 
@@ -1524,6 +1716,7 @@ class AppRepository(
             workspaceDao.deleteWorkspaceItemsForComponentInContainer(packageName, activityName, WorkspaceContainers.HOME)
             workspaceDao.deleteFolderMembersForComponent(packageName, activityName)
             workspaceDao.upsertWorkspaceItem(homeItem)
+            existingMember?.folderId?.let { reconcileSourceFoldersLocked(listOf(it), prefPageCount) }
         }
     }
 
@@ -1534,6 +1727,151 @@ class AppRepository(
         }
     }
 
+    /**
+     * Transactionally moves a HOME app icon to [targetPageIndex] / [targetSlotIndex] using
+     * [WorkspacePlacementPlanner] collision resolution and pre/post [WorkspaceValidator] checks.
+     * Preserves fixed apps, folders, widgets, dock placements, and optional empty spaces.
+     */
+    suspend fun moveAppOnHomeScreen(
+        packageName: String,
+        activityName: String,
+        targetPageIndex: Int,
+        targetSlotIndex: Int,
+        gridColumns: Int,
+        preserveEmptySpaces: Boolean = true
+    ): MoveWorkspaceAppResult = withContext(Dispatchers.IO) {
+        mutationCoordinator.withMutationLock {
+            val dockCount = preferences.dockCountFlow.first().coerceIn(3, 7)
+            val drawerShuffleEnabled = preferences.drawerShuffleEnabledFlow.first()
+
+            try {
+                runInTransaction {
+                    val allInstalled = installedAppDao.getAllAppsList()
+                    val installed = allInstalled.filter { it.isInstalled }
+                    val pages = workspaceDao.getPagesList().sortedBy { it.pageIndex }
+                    val items = workspaceDao.getWorkspaceItemsList()
+                    val foldersEntities = workspaceDao.getFoldersList()
+                    val members = workspaceDao.getFolderMembersList()
+                    val drawers = workspaceDao.getDrawerLayoutsList()
+                    val focusList = workspaceDao.getFocusAppsList()
+
+                    if (pages.isEmpty()) {
+                        return@runInTransaction MoveWorkspaceAppResult(false, "Workspace has no home pages")
+                    }
+                    if (targetPageIndex !in pages.indices || pages.none { it.pageIndex == targetPageIndex }) {
+                        return@runInTransaction MoveWorkspaceAppResult(false, "Target page ${targetPageIndex + 1} no longer exists")
+                    }
+
+                    val targetAppEntity = installed.find { it.packageName == packageName && it.activityName == activityName }
+                        ?: return@runInTransaction MoveWorkspaceAppResult(false, "Application is no longer installed")
+
+                    val currentApps = projectAppItems(installed, pages, items, members, drawers, focusList)
+                    val movingApp = currentApps.find { it.packageName == packageName && it.activityName == activityName }
+                        ?: return@runInTransaction MoveWorkspaceAppResult(false, "Application not found in workspace")
+
+                    if (!movingApp.isOnHomeScreen || movingApp.folderId != null) {
+                        return@runInTransaction MoveWorkspaceAppResult(false, "${targetAppEntity.label} is not placed on the Home screen")
+                    }
+                    if (movingApp.isFixed) {
+                        return@runInTransaction MoveWorkspaceAppResult(false, "${targetAppEntity.label} is fixed and cannot be moved")
+                    }
+
+                    val folders = projectFolders(foldersEntities, items, pages)
+                    val widgets = projectWidgets(items, pages)
+
+                    val plan = placementPlanner.planMove(
+                        PlacementMoveRequest(
+                            packageName = packageName,
+                            activityName = activityName,
+                            targetPageIndex = targetPageIndex,
+                            targetSlotIndex = targetSlotIndex,
+                            gridColumns = gridColumns,
+                            pageCount = pages.size,
+                            preserveEmptySpaces = preserveEmptySpaces,
+                            apps = currentApps,
+                            folders = folders,
+                            widgets = widgets
+                        )
+                    )
+
+                    if (!plan.isValid) {
+                        return@runInTransaction MoveWorkspaceAppResult(false, plan.rejectionReason ?: "Invalid drop target")
+                    }
+
+                    if (plan.changedHomePlacements.isEmpty()) {
+                        return@runInTransaction MoveWorkspaceAppResult(true, movedCount = 0)
+                    }
+
+                    val pageIndexToId = pages.associate { it.pageIndex to it.pageId }
+                    val homeItemByComponent = items
+                        .filter { it.containerType == WorkspaceContainers.HOME && it.itemType == WorkspaceItemTypes.APP && it.packageName != null }
+                        .associateBy { it.packageName!! to (it.activityName ?: "") }
+
+                    val updatedHomeItems = mutableListOf<WorkspaceItemEntity>()
+                    val updatedByItemId = mutableMapOf<String, WorkspaceItemEntity>()
+
+                    for ((comp, newCoord) in plan.changedHomePlacements) {
+                        val existingHome = homeItemByComponent[comp]
+                            ?: throw IllegalStateException("Missing HOME item for ${comp.first}/${comp.second}")
+                        val newPageId = pageIndexToId[newCoord.first]
+                            ?: throw IllegalStateException("Missing pageId for pageIndex ${newCoord.first}")
+                        val updated = existingHome.copy(
+                            pageId = newPageId,
+                            rank = newCoord.second
+                        )
+                        updatedHomeItems.add(updated)
+                        updatedByItemId[updated.itemId] = updated
+                    }
+
+                    val projectedItems = items.map { updatedByItemId[it.itemId] ?: it }
+                    val preCommitValidation = workspaceValidator.validateNormalizedWorkspace(
+                        installedApps = allInstalled,
+                        pages = pages,
+                        workspaceItems = projectedItems,
+                        folders = foldersEntities,
+                        folderMembers = members,
+                        drawerLayouts = drawers,
+                        focusApps = focusList,
+                        dockCount = dockCount,
+                        drawerShuffleEnabled = drawerShuffleEnabled
+                    )
+                    if (!preCommitValidation.isValid) {
+                        throw IllegalStateException(
+                            "Move aborted by invariant check: ${preCommitValidation.errors.joinToString("; ")}"
+                        )
+                    }
+
+                    workspaceDao.upsertWorkspaceItems(updatedHomeItems)
+
+                    val postWriteValidation = workspaceValidator.validateNormalizedWorkspace(
+                        installedApps = installedAppDao.getAllAppsList(),
+                        pages = workspaceDao.getPagesList(),
+                        workspaceItems = workspaceDao.getWorkspaceItemsList(),
+                        folders = workspaceDao.getFoldersList(),
+                        folderMembers = workspaceDao.getFolderMembersList(),
+                        drawerLayouts = workspaceDao.getDrawerLayoutsList(),
+                        focusApps = workspaceDao.getFocusAppsList(),
+                        dockCount = dockCount,
+                        drawerShuffleEnabled = drawerShuffleEnabled
+                    )
+                    if (!postWriteValidation.isValid) {
+                        throw IllegalStateException(
+                            "Post-write move failed invariant check: ${postWriteValidation.errors.joinToString("; ")}"
+                        )
+                    }
+
+                    MoveWorkspaceAppResult(success = true, movedCount = updatedHomeItems.size)
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                MoveWorkspaceAppResult(
+                    success = false,
+                    failureReason = t.message ?: "Failed to move application"
+                )
+            }
+        }
+    }
+
     suspend fun removeAppFromHomeScreen(packageName: String, activityName: String) = withContext(Dispatchers.IO) {
         mutationCoordinator.withMutationLock {
             removeAppFromHomeScreenLocked(packageName, activityName)
@@ -1541,9 +1879,14 @@ class AppRepository(
     }
 
     private suspend fun removeAppFromHomeScreenLocked(packageName: String, activityName: String) {
+        val prefPageCount = preferences.pageCountFlow.first().coerceAtLeast(1)
         runInTransaction {
+            val prevMemberFolderId = workspaceDao.getFolderMembersList()
+                .find { it.packageName == packageName && it.activityName == activityName }
+                ?.folderId
             workspaceDao.deleteWorkspaceItemsForComponentInContainer(packageName, activityName, WorkspaceContainers.HOME)
             workspaceDao.deleteFolderMembersForComponent(packageName, activityName)
+            prevMemberFolderId?.let { reconcileSourceFoldersLocked(listOf(it), prefPageCount) }
         }
     }
 
@@ -1606,6 +1949,7 @@ class AppRepository(
                 workspaceDao.deleteWorkspaceItemsForComponentInContainer(packageName, activityName, WorkspaceContainers.HOME)
                 workspaceDao.deleteFolderMembersForComponent(packageName, activityName)
                 workspaceDao.upsertWorkspaceItem(homeItem)
+                existingMember?.folderId?.let { reconcileSourceFoldersLocked(listOf(it), prefPageCount) }
             }
         }
     }
@@ -1795,15 +2139,27 @@ class AppRepository(
     ): String = withContext(Dispatchers.IO) {
         mutationCoordinator.withMutationLock {
             val prefPageCount = preferences.pageCountFlow.first().coerceAtLeast(1)
+            val dockCount = preferences.dockCountFlow.first().coerceIn(3, 7)
+            val drawerShuffleEnabled = preferences.drawerShuffleEnabledFlow.first()
+            val distinctComponents = components.distinct()
+            require(distinctComponents.size >= 2) { "Folder must contain at least two applications" }
+            val normalizedName = normalizeFolderNameOrDefault(name)
+
             val folderId = UUID.randomUUID().toString()
             runInTransaction {
+                val allInstalled = installedAppDao.getAllAppsList()
+                val installedSet = allInstalled.filter { it.isInstalled }.map { it.packageName to it.activityName }.toSet()
+                require(distinctComponents.all { it in installedSet }) {
+                    "All folder members must be installed applications"
+                }
+
                 val rawPages = workspaceDao.getPagesList()
                 val pages = ensurePagesList(rawPages, prefPageCount)
                 val safePageIndex = pageIndex.coerceIn(0, pages.size - 1)
                 val targetPage = pages.find { it.pageIndex == safePageIndex } ?: pages.first()
                 val items = workspaceDao.getWorkspaceItemsList()
 
-                val compSet = components.toSet()
+                val compSet = distinctComponents.toSet()
                 val existingHomeByComp = items
                     .filter { it.containerType == WorkspaceContainers.HOME && it.packageName != null }
                     .associateBy { it.packageName!! to (it.activityName ?: "") }
@@ -1821,7 +2177,7 @@ class AppRepository(
 
                 val folderEntity = FolderEntity(
                     folderId = folderId,
-                    name = name.ifBlank { "Folder" },
+                    name = normalizedName,
                     createdAt = System.currentTimeMillis()
                 )
                 val folderWorkspaceItem = WorkspaceItemEntity(
@@ -1832,7 +2188,7 @@ class AppRepository(
                     folderId = folderId,
                     rank = assignedRank
                 )
-                val memberEntities = components.distinct().mapIndexed { idx, (pkg, act) ->
+                val memberEntities = distinctComponents.mapIndexed { idx, (pkg, act) ->
                     val prevHome = existingHomeByComp[pkg to act]
                     val prevMember = existingMemberByComp[pkg to act]
                     val prevAny = existingAnyByComp[pkg to act]
@@ -1848,117 +2204,427 @@ class AppRepository(
                     )
                 }
 
+                val affectedOldFolders = distinctComponents.mapNotNull { existingMemberByComp[it]?.folderId }.distinct()
                 if (rawPages.isEmpty()) workspaceDao.insertPages(pages)
                 workspaceDao.upsertFolder(folderEntity)
-                for ((pkg, act) in components.distinct()) {
+                for ((pkg, act) in distinctComponents) {
                     workspaceDao.deleteWorkspaceItemsForComponentInContainer(pkg, act, WorkspaceContainers.HOME)
                     workspaceDao.deleteFolderMembersForComponent(pkg, act)
                 }
-                if (memberEntities.isNotEmpty()) {
-                    workspaceDao.upsertFolderMembers(memberEntities)
-                }
+                workspaceDao.upsertFolderMembers(memberEntities)
                 workspaceDao.upsertWorkspaceItem(folderWorkspaceItem)
+                reconcileSourceFoldersLocked(affectedOldFolders, prefPageCount)
+
+                validateNormalizedDbStateOrThrow(dockCount, drawerShuffleEnabled)
             }
             folderId
         }
     }
 
-    suspend fun renameFolder(folderId: String, newName: String) = withContext(Dispatchers.IO) {
+    /**
+     * Atomically creates a new folder at the target Home app's exact (pageId, rank) containing
+     * [targetPackageName]/[targetActivityName] (rank 0) and [draggedPackageName]/[draggedActivityName] (rank 1).
+     * Rejects fixed apps, uninstalled apps, non-Home apps, and self-folder attempts.
+     * Preserves independent Dock placements.
+     */
+    suspend fun createFolderFromHomeApps(
+        draggedPackageName: String,
+        draggedActivityName: String,
+        targetPackageName: String,
+        targetActivityName: String,
+        name: String = DEFAULT_FOLDER_NAME
+    ): FolderMutationResult = withContext(Dispatchers.IO) {
         mutationCoordinator.withMutationLock {
-            runInTransaction {
-                val folder = workspaceDao.getFoldersList().find { it.folderId == folderId } ?: return@runInTransaction
-                workspaceDao.upsertFolder(folder.copy(name = newName.ifBlank { "Folder" }))
+            if (draggedPackageName == targetPackageName && draggedActivityName == targetActivityName) {
+                return@withMutationLock FolderMutationResult(false, null, "Cannot create a folder containing the same app twice")
+            }
+            val normalizedName = normalizeFolderNameOrDefault(name)
+            val dockCount = preferences.dockCountFlow.first().coerceIn(3, 7)
+            val drawerShuffleEnabled = preferences.drawerShuffleEnabledFlow.first()
+            val prefPageCount = preferences.pageCountFlow.first().coerceAtLeast(1)
+
+            try {
+                runInTransaction {
+                    val allInstalled = installedAppDao.getAllAppsList()
+                    val installed = allInstalled.filter { it.isInstalled }
+                    val rawPages = workspaceDao.getPagesList()
+                    val pages = ensurePagesList(rawPages, prefPageCount)
+                    if (rawPages.isEmpty()) workspaceDao.insertPages(pages)
+                    val items = workspaceDao.getWorkspaceItemsList()
+                    val members = workspaceDao.getFolderMembersList()
+                    val drawers = workspaceDao.getDrawerLayoutsList()
+                    val focusList = workspaceDao.getFocusAppsList()
+
+                    val currentApps = projectAppItems(installed, pages, items, members, drawers, focusList)
+                    val draggedApp = currentApps.find {
+                        it.packageName == draggedPackageName && it.activityName == draggedActivityName
+                    } ?: return@runInTransaction FolderMutationResult(false, null, "Dragged application is not installed")
+                    val targetApp = currentApps.find {
+                        it.packageName == targetPackageName && it.activityName == targetActivityName
+                    } ?: return@runInTransaction FolderMutationResult(false, null, "Target application is not installed")
+
+                    val (canCreate, rejectReason) = placementPlanner.canCreateFolderFromApps(draggedApp, targetApp)
+                    if (!canCreate) {
+                        return@runInTransaction FolderMutationResult(false, null, rejectReason ?: "Cannot create folder")
+                    }
+
+                    val targetHomeItem = items.find {
+                        it.containerType == WorkspaceContainers.HOME &&
+                            it.itemType == WorkspaceItemTypes.APP &&
+                            it.packageName == targetPackageName &&
+                            it.activityName == targetActivityName
+                    } ?: return@runInTransaction FolderMutationResult(false, null, "Target application is not on Home screen")
+
+                    val targetPageId = targetHomeItem.pageId
+                        ?: return@runInTransaction FolderMutationResult(false, null, "Target application has missing page")
+
+                    val folderId = UUID.randomUUID().toString()
+                    val folderEntity = FolderEntity(
+                        folderId = folderId,
+                        name = normalizedName,
+                        createdAt = System.currentTimeMillis()
+                    )
+                    val folderWorkspaceItem = WorkspaceItemEntity(
+                        itemId = folderItemId(folderId),
+                        itemType = WorkspaceItemTypes.FOLDER,
+                        containerType = WorkspaceContainers.HOME,
+                        pageId = targetPageId,
+                        folderId = folderId,
+                        rank = targetHomeItem.rank
+                    )
+
+                    val memberEntities = listOf(
+                        FolderMemberEntity(
+                            folderId = folderId,
+                            packageName = targetApp.packageName,
+                            activityName = targetApp.activityName,
+                            rank = 0,
+                            isFixed = false,
+                            isShuffled = targetApp.isShuffled
+                        ),
+                        FolderMemberEntity(
+                            folderId = folderId,
+                            packageName = draggedApp.packageName,
+                            activityName = draggedApp.activityName,
+                            rank = 1,
+                            isFixed = false,
+                            isShuffled = draggedApp.isShuffled
+                        )
+                    )
+
+                    workspaceDao.upsertFolder(folderEntity)
+                    workspaceDao.deleteWorkspaceItemsForComponentInContainer(
+                        targetPackageName,
+                        targetActivityName,
+                        WorkspaceContainers.HOME
+                    )
+                    workspaceDao.deleteWorkspaceItemsForComponentInContainer(
+                        draggedPackageName,
+                        draggedActivityName,
+                        WorkspaceContainers.HOME
+                    )
+                    workspaceDao.deleteFolderMembersForComponent(targetPackageName, targetActivityName)
+                    workspaceDao.deleteFolderMembersForComponent(draggedPackageName, draggedActivityName)
+                    workspaceDao.upsertFolderMembers(memberEntities)
+                    workspaceDao.upsertWorkspaceItem(folderWorkspaceItem)
+
+                    validateNormalizedDbStateOrThrow(dockCount, drawerShuffleEnabled)
+                    FolderMutationResult(success = true, folderId = folderId)
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                FolderMutationResult(false, null, t.message ?: "Failed to create folder")
             }
         }
     }
 
-    suspend fun deleteFolder(folderId: String) = withContext(Dispatchers.IO) {
+    /**
+     * Transactionally moves a HOME folder to [targetPageIndex] / [targetSlotIndex] using
+     * [WorkspacePlacementPlanner.planFolderMove], shifting movable Home apps if needed while
+     * preserving folder membership, fixed apps, widgets, other folders, and Dock placements.
+     */
+    suspend fun moveFolderOnHomeScreen(
+        folderId: String,
+        targetPageIndex: Int,
+        targetSlotIndex: Int,
+        gridColumns: Int,
+        preserveEmptySpaces: Boolean = true
+    ): MoveWorkspaceAppResult = withContext(Dispatchers.IO) {
+        mutationCoordinator.withMutationLock {
+            val dockCount = preferences.dockCountFlow.first().coerceIn(3, 7)
+            val drawerShuffleEnabled = preferences.drawerShuffleEnabledFlow.first()
+
+            try {
+                runInTransaction {
+                    val allInstalled = installedAppDao.getAllAppsList()
+                    val installed = allInstalled.filter { it.isInstalled }
+                    val pages = workspaceDao.getPagesList().sortedBy { it.pageIndex }
+                    val items = workspaceDao.getWorkspaceItemsList()
+                    val foldersEntities = workspaceDao.getFoldersList()
+                    val members = workspaceDao.getFolderMembersList()
+                    val drawers = workspaceDao.getDrawerLayoutsList()
+                    val focusList = workspaceDao.getFocusAppsList()
+
+                    if (pages.isEmpty()) {
+                        return@runInTransaction MoveWorkspaceAppResult(false, "Workspace has no home pages")
+                    }
+                    if (targetPageIndex !in pages.indices || pages.none { it.pageIndex == targetPageIndex }) {
+                        return@runInTransaction MoveWorkspaceAppResult(false, "Target page ${targetPageIndex + 1} no longer exists")
+                    }
+
+                    val currentApps = projectAppItems(installed, pages, items, members, drawers, focusList)
+                    val folders = projectFolders(foldersEntities, items, pages)
+                    val widgets = projectWidgets(items, pages)
+
+                    val plan = placementPlanner.planFolderMove(
+                        FolderMoveRequest(
+                            folderId = folderId,
+                            targetPageIndex = targetPageIndex,
+                            targetSlotIndex = targetSlotIndex,
+                            gridColumns = gridColumns,
+                            pageCount = pages.size,
+                            preserveEmptySpaces = preserveEmptySpaces,
+                            apps = currentApps,
+                            folders = folders,
+                            widgets = widgets
+                        )
+                    )
+
+                    if (!plan.isValid || plan.movedFolder == null) {
+                        return@runInTransaction MoveWorkspaceAppResult(false, plan.rejectionReason ?: "Invalid folder drop target")
+                    }
+
+                    val folderHomeItem = items.find {
+                        it.containerType == WorkspaceContainers.HOME &&
+                            it.itemType == WorkspaceItemTypes.FOLDER &&
+                            it.folderId == folderId
+                    } ?: return@runInTransaction MoveWorkspaceAppResult(false, "Folder placement missing")
+
+                    val pageIndexToId = pages.associate { it.pageIndex to it.pageId }
+                    val targetPageId = pageIndexToId[plan.movedFolder.pageIndex]
+                        ?: throw IllegalStateException("Missing pageId for pageIndex ${plan.movedFolder.pageIndex}")
+
+                    if (folderHomeItem.pageId == targetPageId &&
+                        folderHomeItem.rank == plan.movedFolder.slotIndex &&
+                        plan.changedHomePlacements.isEmpty()
+                    ) {
+                        return@runInTransaction MoveWorkspaceAppResult(true, movedCount = 0)
+                    }
+
+                    val updatedItems = mutableListOf<WorkspaceItemEntity>()
+                    updatedItems.add(folderHomeItem.copy(pageId = targetPageId, rank = plan.movedFolder.slotIndex))
+
+                    val homeItemByComponent = items
+                        .filter { it.containerType == WorkspaceContainers.HOME && it.itemType == WorkspaceItemTypes.APP && it.packageName != null }
+                        .associateBy { it.packageName!! to (it.activityName ?: "") }
+
+                    for ((comp, newCoord) in plan.changedHomePlacements) {
+                        val existingHome = homeItemByComponent[comp]
+                            ?: throw IllegalStateException("Missing HOME item for ${comp.first}/${comp.second}")
+                        val newPageId = pageIndexToId[newCoord.first]
+                            ?: throw IllegalStateException("Missing pageId for pageIndex ${newCoord.first}")
+                        updatedItems.add(existingHome.copy(pageId = newPageId, rank = newCoord.second))
+                    }
+
+                    workspaceDao.upsertWorkspaceItems(updatedItems)
+                    validateNormalizedDbStateOrThrow(dockCount, drawerShuffleEnabled)
+                    MoveWorkspaceAppResult(success = true, movedCount = updatedItems.size)
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                MoveWorkspaceAppResult(false, t.message ?: "Failed to move folder")
+            }
+        }
+    }
+
+    suspend fun renameFolderResult(folderId: String, newName: String): FolderMutationResult = withContext(Dispatchers.IO) {
+        val validatedName = normalizeAndValidateFolderName(newName).getOrElse { error ->
+            return@withContext FolderMutationResult(false, folderId, error.message ?: "Invalid folder name")
+        }
+        mutationCoordinator.withMutationLock {
+            val dockCount = preferences.dockCountFlow.first().coerceIn(3, 7)
+            val drawerShuffleEnabled = preferences.drawerShuffleEnabledFlow.first()
+            try {
+                runInTransaction {
+                    val folder = workspaceDao.getFoldersList().find { it.folderId == folderId }
+                        ?: return@runInTransaction FolderMutationResult(false, folderId, "Folder no longer exists")
+                    workspaceDao.upsertFolder(folder.copy(name = validatedName))
+                    validateNormalizedDbStateOrThrow(dockCount, drawerShuffleEnabled)
+                    FolderMutationResult(true, folderId)
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                FolderMutationResult(false, folderId, t.message ?: "Failed to rename folder")
+            }
+        }
+    }
+
+    suspend fun renameFolder(folderId: String, newName: String) {
+        renameFolderResult(folderId, newName)
+    }
+
+    suspend fun deleteFolderResult(folderId: String): FolderMutationResult = withContext(Dispatchers.IO) {
         mutationCoordinator.withMutationLock {
             val prefPageCount = preferences.pageCountFlow.first().coerceAtLeast(1)
-            runInTransaction {
-                val rawPages = workspaceDao.getPagesList()
-                val pages = ensurePagesList(rawPages, prefPageCount)
-                if (rawPages.isEmpty()) workspaceDao.insertPages(pages)
-                val items = workspaceDao.getWorkspaceItemsList()
-                val folderItem = items.find { it.itemType == WorkspaceItemTypes.FOLDER && it.folderId == folderId }
-                val targetPage = pages.find { it.pageId == folderItem?.pageId } ?: pages.first()
-                val members = workspaceDao.getFolderMembersList().filter { it.folderId == folderId }.sortedBy { it.rank }
+            val dockCount = preferences.dockCountFlow.first().coerceIn(3, 7)
+            val drawerShuffleEnabled = preferences.drawerShuffleEnabledFlow.first()
+            try {
+                runInTransaction {
+                    val existingFolder = workspaceDao.getFoldersList().find { it.folderId == folderId }
+                        ?: return@runInTransaction FolderMutationResult(false, folderId, "Folder no longer exists")
+                    val rawPages = workspaceDao.getPagesList()
+                    val pages = ensurePagesList(rawPages, prefPageCount)
+                    if (rawPages.isEmpty()) workspaceDao.insertPages(pages)
+                    val installedSet = installedAppDao.getAllAppsList()
+                        .filter { it.isInstalled }
+                        .map { it.packageName to it.activityName }
+                        .toSet()
+                    val items = workspaceDao.getWorkspaceItemsList()
+                    val folderItem = items.find { it.itemType == WorkspaceItemTypes.FOLDER && it.folderId == existingFolder.folderId }
+                    val targetPage = pages.find { it.pageId == folderItem?.pageId } ?: pages.first()
+                    val members = workspaceDao.getFolderMembersList()
+                        .filter { it.folderId == folderId && (it.packageName to it.activityName) in installedSet }
+                        .sortedWith(compareBy<FolderMemberEntity> { it.rank }.thenBy { it.packageName }.thenBy { it.activityName })
 
-                val remainingItems = items.filter { !(it.itemType == WorkspaceItemTypes.FOLDER && it.folderId == folderId) }.toMutableList()
-                val unpackedItems = mutableListOf<WorkspaceItemEntity>()
-                for (member in members) {
-                    val rank = nextFreeRankForPage(targetPage.pageId, folderItem?.rank ?: 0, remainingItems)
-                    val restored = WorkspaceItemEntity(
-                        itemId = homeItemId(member.packageName, member.activityName),
-                        itemType = WorkspaceItemTypes.APP,
-                        containerType = WorkspaceContainers.HOME,
-                        pageId = targetPage.pageId,
-                        packageName = member.packageName,
-                        activityName = member.activityName,
-                        rank = rank,
-                        isFixed = member.isFixed,
-                        isShuffled = member.isShuffled
-                    )
-                    unpackedItems.add(restored)
-                    remainingItems.add(restored)
-                }
+                    val dockByComp = items
+                        .filter { it.containerType == WorkspaceContainers.DOCK && it.packageName != null }
+                        .associateBy { it.packageName!! to (it.activityName ?: "") }
 
-                workspaceDao.deleteWorkspaceItemsForFolder(folderId)
-                workspaceDao.deleteFolderMembersByFolder(folderId)
-                workspaceDao.deleteFolder(folderId)
-                if (unpackedItems.isNotEmpty()) {
-                    workspaceDao.upsertWorkspaceItems(unpackedItems)
+                    val remainingItems = items.filter { !(it.itemType == WorkspaceItemTypes.FOLDER && it.folderId == folderId) }.toMutableList()
+                    val unpackedItems = mutableListOf<WorkspaceItemEntity>()
+                    for (member in members) {
+                        remainingItems.removeAll {
+                            it.containerType == WorkspaceContainers.HOME &&
+                                it.packageName == member.packageName &&
+                                it.activityName == member.activityName
+                        }
+                        val rank = nextFreeRankForPage(targetPage.pageId, folderItem?.rank ?: 0, remainingItems)
+                        val dockItem = dockByComp[member.packageName to member.activityName]
+                        val restored = WorkspaceItemEntity(
+                            itemId = homeItemId(member.packageName, member.activityName),
+                            itemType = WorkspaceItemTypes.APP,
+                            containerType = WorkspaceContainers.HOME,
+                            pageId = targetPage.pageId,
+                            packageName = member.packageName,
+                            activityName = member.activityName,
+                            rank = rank,
+                            isFixed = member.isFixed,
+                            isShuffled = !member.isFixed && member.isShuffled,
+                            isHidden = dockItem?.isHidden ?: false
+                        )
+                        unpackedItems.add(restored)
+                        remainingItems.add(restored)
+                    }
+
+                    workspaceDao.deleteWorkspaceItemsForFolder(folderId)
+                    workspaceDao.deleteFolderMembersByFolder(folderId)
+                    workspaceDao.deleteFolder(folderId)
+                    if (unpackedItems.isNotEmpty()) {
+                        workspaceDao.upsertWorkspaceItems(unpackedItems)
+                    }
+                    validateNormalizedDbStateOrThrow(dockCount, drawerShuffleEnabled)
+                    FolderMutationResult(true, folderId)
                 }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                FolderMutationResult(false, folderId, t.message ?: "Failed to delete folder")
             }
         }
     }
 
-    suspend fun addAppToFolder(packageName: String, activityName: String, folderId: String) = withContext(Dispatchers.IO) {
+    suspend fun deleteFolder(folderId: String) {
+        deleteFolderResult(folderId)
+    }
+
+    suspend fun addAppToFolderResult(
+        packageName: String,
+        activityName: String,
+        folderId: String
+    ): FolderMutationResult = withContext(Dispatchers.IO) {
         mutationCoordinator.withMutationLock {
             addAppToFolderLocked(packageName, activityName, folderId)
         }
     }
 
-    private suspend fun addAppToFolderLocked(packageName: String, activityName: String, folderId: String) {
-        runInTransaction {
-            val folderExists = workspaceDao.getFoldersList().any { it.folderId == folderId }
-            if (!folderExists) return@runInTransaction
+    suspend fun addAppToFolder(packageName: String, activityName: String, folderId: String) {
+        addAppToFolderResult(packageName, activityName, folderId)
+    }
 
-            val items = workspaceDao.getWorkspaceItemsList()
-            val prevHomeItem = items.find {
-                it.containerType == WorkspaceContainers.HOME &&
-                    it.packageName == packageName &&
-                    it.activityName == activityName
+    private suspend fun addAppToFolderLocked(
+        packageName: String,
+        activityName: String,
+        folderId: String
+    ): FolderMutationResult {
+        val prefPageCount = preferences.pageCountFlow.first().coerceAtLeast(1)
+        val dockCount = preferences.dockCountFlow.first().coerceIn(3, 7)
+        val drawerShuffleEnabled = preferences.drawerShuffleEnabledFlow.first()
+        return try {
+            runInTransaction {
+                val folderExists = workspaceDao.getFoldersList().any { it.folderId == folderId }
+                if (!folderExists) {
+                    return@runInTransaction FolderMutationResult(false, folderId, "Target folder no longer exists")
+                }
+
+                val installed = installedAppDao.getAllAppsList().find {
+                    it.isInstalled && it.packageName == packageName && it.activityName == activityName
+                } ?: return@runInTransaction FolderMutationResult(false, folderId, "Application is not installed")
+
+                val items = workspaceDao.getWorkspaceItemsList()
+                val prevHomeItem = items.find {
+                    it.containerType == WorkspaceContainers.HOME &&
+                        it.packageName == installed.packageName &&
+                        it.activityName == installed.activityName
+                }
+                val prevDockItem = items.find {
+                    it.containerType == WorkspaceContainers.DOCK &&
+                        it.packageName == installed.packageName &&
+                        it.activityName == installed.activityName
+                }
+                val existingMembers = workspaceDao.getFolderMembersList()
+                val prevMember = existingMembers.find { it.packageName == packageName && it.activityName == activityName }
+                if (prevMember?.folderId == folderId && prevHomeItem == null) {
+                    return@runInTransaction FolderMutationResult(true, folderId)
+                }
+
+                val destMembers = existingMembers
+                    .filter { it.folderId == folderId }
+                    .sortedWith(compareBy<FolderMemberEntity> { it.rank }.thenBy { it.packageName }.thenBy { it.activityName })
+                val repackedDest = destMembers.mapIndexedNotNull { idx, m ->
+                    if (m.rank != idx) m.copy(rank = idx) else null
+                }
+
+                val nextMemberRank = destMembers.size
+                val isFixed = prevHomeItem?.isFixed ?: prevMember?.isFixed ?: prevDockItem?.isFixed ?: false
+                val isShuffled = !isFixed && (prevHomeItem?.isShuffled ?: prevMember?.isShuffled ?: prevDockItem?.isShuffled ?: false)
+
+                val member = FolderMemberEntity(
+                    folderId = folderId,
+                    packageName = packageName,
+                    activityName = activityName,
+                    rank = nextMemberRank,
+                    isFixed = isFixed,
+                    isShuffled = isShuffled
+                )
+
+                val oldFolderId = prevMember?.folderId?.takeIf { it != folderId }
+                workspaceDao.deleteWorkspaceItemsForComponentInContainer(packageName, activityName, WorkspaceContainers.HOME)
+                workspaceDao.deleteFolderMembersForComponent(packageName, activityName)
+                if (repackedDest.isNotEmpty()) {
+                    workspaceDao.upsertFolderMembers(repackedDest)
+                }
+                workspaceDao.upsertFolderMember(member)
+
+                // Reconcile source folder if moved from another folder (repack >=2, dissolve at <=1)
+                if (oldFolderId != null) {
+                    reconcileSourceFoldersLocked(listOf(oldFolderId), prefPageCount)
+                }
+
+                validateNormalizedDbStateOrThrow(dockCount, drawerShuffleEnabled)
+                FolderMutationResult(true, folderId)
             }
-            val prevDockItem = items.find {
-                it.containerType == WorkspaceContainers.DOCK &&
-                    it.packageName == packageName &&
-                    it.activityName == activityName
-            }
-            val existingMembers = workspaceDao.getFolderMembersList()
-            val prevMember = existingMembers.find { it.packageName == packageName && it.activityName == activityName }
-            if (prevMember?.folderId == folderId && prevHomeItem == null) return@runInTransaction
-
-            val nextMemberRank = if (prevMember?.folderId == folderId) {
-                prevMember.rank
-            } else {
-                (existingMembers.filter { it.folderId == folderId }.maxOfOrNull { it.rank } ?: -1) + 1
-            }
-            val isFixed = prevHomeItem?.isFixed ?: prevMember?.isFixed ?: prevDockItem?.isFixed ?: false
-            val isShuffled = !isFixed && (prevHomeItem?.isShuffled ?: prevMember?.isShuffled ?: prevDockItem?.isShuffled ?: false)
-
-            val member = FolderMemberEntity(
-                folderId = folderId,
-                packageName = packageName,
-                activityName = activityName,
-                rank = nextMemberRank,
-                isFixed = isFixed,
-                isShuffled = isShuffled
-            )
-
-            workspaceDao.deleteWorkspaceItemsForComponentInContainer(packageName, activityName, WorkspaceContainers.HOME)
-            workspaceDao.deleteFolderMembersForComponent(packageName, activityName)
-            workspaceDao.upsertFolderMember(member)
+        } catch (t: Throwable) {
+            if (t is CancellationException) throw t
+            FolderMutationResult(false, folderId, t.message ?: "Failed to add application to folder")
         }
     }
 
@@ -1969,49 +2635,272 @@ class AppRepository(
         }
     }
 
-    suspend fun removeAppFromFolder(packageName: String, activityName: String, targetPage: Int = 0) = withContext(Dispatchers.IO) {
+    /**
+     * Persists a deterministic reordering of existing members inside [folderId] without altering
+     * Home or Dock placements or allowing duplicate/missing members.
+     */
+    suspend fun reorderFolderMembers(
+        folderId: String,
+        orderedComponents: List<Pair<String, String>>
+    ): FolderMutationResult = withContext(Dispatchers.IO) {
+        mutationCoordinator.withMutationLock {
+            val dockCount = preferences.dockCountFlow.first().coerceIn(3, 7)
+            val drawerShuffleEnabled = preferences.drawerShuffleEnabledFlow.first()
+            try {
+                runInTransaction {
+                    val folderExists = workspaceDao.getFoldersList().any { it.folderId == folderId }
+                    if (!folderExists) {
+                        return@runInTransaction FolderMutationResult(false, folderId, "Folder no longer exists")
+                    }
+                    if (orderedComponents.distinct().size != orderedComponents.size) {
+                        return@runInTransaction FolderMutationResult(false, folderId, "Duplicate folder members are not allowed")
+                    }
+
+                    val existingMembers = workspaceDao.getFolderMembersList()
+                        .filter { it.folderId == folderId }
+                    val existingByComp = existingMembers.associateBy { it.packageName to it.activityName }
+                    if (orderedComponents.size != existingByComp.size || orderedComponents.toSet() != existingByComp.keys) {
+                        return@runInTransaction FolderMutationResult(false, folderId, "Folder member list does not match persisted members")
+                    }
+
+                    val reorderedEntities = orderedComponents.mapIndexed { idx, comp ->
+                        existingByComp.getValue(comp).copy(rank = idx)
+                    }
+                    workspaceDao.upsertFolderMembers(reorderedEntities)
+                    validateNormalizedDbStateOrThrow(dockCount, drawerShuffleEnabled)
+                    FolderMutationResult(true, folderId)
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                FolderMutationResult(false, folderId, t.message ?: "Failed to reorder folder apps")
+            }
+        }
+    }
+
+    /**
+     * Removes [packageName]/[activityName] from its folder and places it safely on [targetPage]
+     * without uninstalling the app or disturbing its Dock placement.
+     *
+     * Empty/single-member rule:
+     * - If 0 members remain after removal, the empty folder is deleted.
+     * - If 1 member remains after removal, the folder dissolves automatically and that last member
+     *   inherits the folder's Home slot so invalid empty or single-app folders are not left behind.
+     * - If 2+ members remain, their folder ranks are re-packed contiguously (0..N-1).
+     */
+    suspend fun removeAppFromFolderResult(
+        packageName: String,
+        activityName: String,
+        targetPage: Int = 0
+    ): FolderMutationResult = withContext(Dispatchers.IO) {
         mutationCoordinator.withMutationLock {
             val prefPageCount = preferences.pageCountFlow.first().coerceAtLeast(1)
-            runInTransaction {
-                val rawPages = workspaceDao.getPagesList()
-                val pages = ensurePagesList(rawPages, prefPageCount)
-                if (rawPages.isEmpty()) workspaceDao.insertPages(pages)
-                val safePageIndex = targetPage.coerceIn(0, pages.size - 1)
-                val page = pages.find { it.pageIndex == safePageIndex } ?: pages.first()
-                val member = workspaceDao.getFolderMembersList()
-                    .find { it.packageName == packageName && it.activityName == activityName }
-                val items = workspaceDao.getWorkspaceItemsList()
-                val existingDock = items.find {
-                    it.containerType == WorkspaceContainers.DOCK &&
-                        it.packageName == packageName &&
-                        it.activityName == activityName
-                }
-                val filteredHomeItems = items.filter {
-                    !(it.containerType == WorkspaceContainers.HOME &&
-                        it.packageName == packageName &&
-                        it.activityName == activityName)
-                }
-                val rank = nextFreeRankForPage(page.pageId, 0, filteredHomeItems)
-                val isFixed = member?.isFixed ?: existingDock?.isFixed ?: false
-                val isShuffled = !isFixed && (member?.isShuffled ?: existingDock?.isShuffled ?: false)
+            val dockCount = preferences.dockCountFlow.first().coerceIn(3, 7)
+            val drawerShuffleEnabled = preferences.drawerShuffleEnabledFlow.first()
+            try {
+                runInTransaction {
+                    val rawPages = workspaceDao.getPagesList()
+                    val pages = ensurePagesList(rawPages, prefPageCount)
+                    if (pages.isEmpty()) {
+                        return@runInTransaction FolderMutationResult(false, null, "No home pages available")
+                    }
+                    if (rawPages.isEmpty()) workspaceDao.insertPages(pages)
 
-                val restoredHome = WorkspaceItemEntity(
-                    itemId = homeItemId(packageName, activityName),
-                    itemType = WorkspaceItemTypes.APP,
-                    containerType = WorkspaceContainers.HOME,
-                    pageId = page.pageId,
-                    packageName = packageName,
-                    activityName = activityName,
-                    rank = rank,
-                    isFixed = isFixed,
-                    isShuffled = isShuffled,
-                    isHidden = existingDock?.isHidden ?: false
-                )
+                    val allMembers = workspaceDao.getFolderMembersList()
+                    val member = allMembers.find { it.packageName == packageName && it.activityName == activityName }
+                        ?: return@runInTransaction FolderMutationResult(false, null, "Application is not inside a folder")
 
-                workspaceDao.deleteFolderMembersForComponent(packageName, activityName)
-                workspaceDao.deleteWorkspaceItemsForComponentInContainer(packageName, activityName, WorkspaceContainers.HOME)
-                workspaceDao.upsertWorkspaceItem(restoredHome)
+                    val folderId = member.folderId
+                    val safePageIndex = targetPage.coerceIn(0, pages.size - 1)
+                    val page = pages.find { it.pageIndex == safePageIndex } ?: pages.first()
+                    val items = workspaceDao.getWorkspaceItemsList()
+                    val folderItem = items.find { it.itemType == WorkspaceItemTypes.FOLDER && it.folderId == folderId }
+
+                    val existingDock = items.find {
+                        it.containerType == WorkspaceContainers.DOCK &&
+                            it.packageName == packageName &&
+                            it.activityName == activityName
+                    }
+
+                    val remainingMembers = allMembers
+                        .filter { it.folderId == folderId && !(it.packageName == packageName && it.activityName == activityName) }
+                        .sortedBy { it.rank }
+
+                    val workingHomeItems = items.filter {
+                        !(it.containerType == WorkspaceContainers.HOME &&
+                            it.packageName == packageName &&
+                            it.activityName == activityName)
+                    }.toMutableList()
+
+                    workspaceDao.deleteFolderMembersForComponent(packageName, activityName)
+                    workspaceDao.deleteWorkspaceItemsForComponentInContainer(
+                        packageName,
+                        activityName,
+                        WorkspaceContainers.HOME
+                    )
+
+                    if (remainingMembers.size <= 1) {
+                        // Dissolve folder on 0 or 1 remaining member
+                        workingHomeItems.removeAll { it.itemType == WorkspaceItemTypes.FOLDER && it.folderId == folderId }
+                        workspaceDao.deleteWorkspaceItemsForFolder(folderId)
+                        workspaceDao.deleteFolderMembersByFolder(folderId)
+                        workspaceDao.deleteFolder(folderId)
+
+                        val lastMember = remainingMembers.firstOrNull()
+                        if (lastMember != null) {
+                            val lastDock = items.find {
+                                it.containerType == WorkspaceContainers.DOCK &&
+                                    it.packageName == lastMember.packageName &&
+                                    it.activityName == lastMember.activityName
+                            }
+                            val lastPageId = folderItem?.pageId?.takeIf { pId -> pages.any { it.pageId == pId } } ?: page.pageId
+                            val lastRank = folderItem?.rank?.takeIf { rank ->
+                                workingHomeItems.none { it.containerType == WorkspaceContainers.HOME && it.pageId == lastPageId && it.rank == rank }
+                            } ?: nextFreeRankForPage(lastPageId, 0, workingHomeItems)
+
+                            val restoredLast = WorkspaceItemEntity(
+                                itemId = homeItemId(lastMember.packageName, lastMember.activityName),
+                                itemType = WorkspaceItemTypes.APP,
+                                containerType = WorkspaceContainers.HOME,
+                                pageId = lastPageId,
+                                packageName = lastMember.packageName,
+                                activityName = lastMember.activityName,
+                                rank = lastRank,
+                                isFixed = lastMember.isFixed,
+                                isShuffled = !lastMember.isFixed && lastMember.isShuffled,
+                                isHidden = lastDock?.isHidden ?: false
+                            )
+                            workingHomeItems.add(restoredLast)
+                            workspaceDao.upsertWorkspaceItem(restoredLast)
+                        }
+                    } else {
+                        val repacked = remainingMembers.mapIndexed { idx, m -> m.copy(rank = idx) }
+                        workspaceDao.upsertFolderMembers(repacked)
+                    }
+
+                    val preferredRank = if (folderItem?.pageId == page.pageId) folderItem.rank else 0
+                    val rank = nextFreeRankForPage(page.pageId, preferredRank, workingHomeItems)
+                    val isFixed = member.isFixed
+                    val isShuffled = !isFixed && member.isShuffled
+
+                    val restoredHome = WorkspaceItemEntity(
+                        itemId = homeItemId(packageName, activityName),
+                        itemType = WorkspaceItemTypes.APP,
+                        containerType = WorkspaceContainers.HOME,
+                        pageId = page.pageId,
+                        packageName = packageName,
+                        activityName = activityName,
+                        rank = rank,
+                        isFixed = isFixed,
+                        isShuffled = isShuffled,
+                        isHidden = existingDock?.isHidden ?: false
+                    )
+                    workspaceDao.upsertWorkspaceItem(restoredHome)
+
+                    validateNormalizedDbStateOrThrow(dockCount, drawerShuffleEnabled)
+                    FolderMutationResult(true, folderId)
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                FolderMutationResult(false, null, t.message ?: "Failed to remove application from folder")
             }
+        }
+    }
+
+    suspend fun removeAppFromFolder(packageName: String, activityName: String, targetPage: Int = 0) {
+        removeAppFromFolderResult(packageName, activityName, targetPage)
+    }
+
+    /**
+     * Reconciles source folders after a member leaves (e.g., cross-folder move, Home placement):
+     * - >= 2 installed members remaining: repacks ranks contiguously 0..N-1.
+     * - 1 installed member remaining: dissolves folder and unpacks survivor onto HOME at the
+     *   folder's former slot (or next free slot), preserving Dock and item flags.
+     * - 0 installed members remaining: deletes empty folder and its HOME item.
+     */
+    private suspend fun reconcileSourceFoldersLocked(
+        affectedFolderIds: Collection<String>,
+        prefPageCount: Int
+    ) {
+        if (affectedFolderIds.isEmpty()) return
+        val rawPages = workspaceDao.getPagesList()
+        val pages = ensurePagesList(rawPages, prefPageCount)
+        if (rawPages.isEmpty()) workspaceDao.insertPages(pages)
+
+        val foldersById = workspaceDao.getFoldersList().associateBy { it.folderId }
+        val installedSet = installedAppDao.getAllAppsList()
+            .filter { it.isInstalled }
+            .map { it.packageName to it.activityName }
+            .toSet()
+        val items = workspaceDao.getWorkspaceItemsList().toMutableList()
+        val allMembers = workspaceDao.getFolderMembersList()
+
+        for (srcFolderId in affectedFolderIds.distinct().sorted()) {
+            if (srcFolderId !in foldersById) continue
+            val folderItem = items.find { it.itemType == WorkspaceItemTypes.FOLDER && it.folderId == srcFolderId }
+            val remainingMembers = allMembers
+                .filter { it.folderId == srcFolderId && (it.packageName to it.activityName) in installedSet }
+                .sortedWith(compareBy<FolderMemberEntity> { it.rank }.thenBy { it.packageName }.thenBy { it.activityName })
+
+            if (remainingMembers.size >= 2) {
+                val repacked = remainingMembers.mapIndexedNotNull { idx, m ->
+                    if (m.rank != idx) m.copy(rank = idx) else null
+                }
+                if (repacked.isNotEmpty()) {
+                    workspaceDao.upsertFolderMembers(repacked)
+                }
+            } else {
+                items.removeAll { it.itemType == WorkspaceItemTypes.FOLDER && it.folderId == srcFolderId }
+                workspaceDao.deleteWorkspaceItemsForFolder(srcFolderId)
+                workspaceDao.deleteFolderMembersByFolder(srcFolderId)
+                workspaceDao.deleteFolder(srcFolderId)
+
+                val survivor = remainingMembers.singleOrNull()
+                if (survivor != null) {
+                    items.removeAll {
+                        it.containerType == WorkspaceContainers.HOME &&
+                            it.packageName == survivor.packageName &&
+                            it.activityName == survivor.activityName
+                    }
+                    val dockItem = items.find {
+                        it.containerType == WorkspaceContainers.DOCK &&
+                            it.packageName == survivor.packageName &&
+                            it.activityName == survivor.activityName
+                    }
+                    val targetPage = pages.find { it.pageId == folderItem?.pageId } ?: pages.first()
+                    val rank = nextFreeRankForPage(targetPage.pageId, folderItem?.rank ?: 0, items)
+                    val restoredHome = WorkspaceItemEntity(
+                        itemId = homeItemId(survivor.packageName, survivor.activityName),
+                        itemType = WorkspaceItemTypes.APP,
+                        containerType = WorkspaceContainers.HOME,
+                        pageId = targetPage.pageId,
+                        packageName = survivor.packageName,
+                        activityName = survivor.activityName,
+                        rank = rank,
+                        isFixed = survivor.isFixed,
+                        isShuffled = !survivor.isFixed && survivor.isShuffled,
+                        isHidden = dockItem?.isHidden ?: false
+                    )
+                    items.add(restoredHome)
+                    workspaceDao.upsertWorkspaceItem(restoredHome)
+                }
+            }
+        }
+    }
+
+    private suspend fun validateNormalizedDbStateOrThrow(dockCount: Int, drawerShuffleEnabled: Boolean) {
+        val result = workspaceValidator.validateNormalizedWorkspace(
+            installedApps = installedAppDao.getAllAppsList(),
+            pages = workspaceDao.getPagesList(),
+            workspaceItems = workspaceDao.getWorkspaceItemsList(),
+            folders = workspaceDao.getFoldersList(),
+            folderMembers = workspaceDao.getFolderMembersList(),
+            drawerLayouts = workspaceDao.getDrawerLayoutsList(),
+            focusApps = workspaceDao.getFocusAppsList(),
+            dockCount = dockCount,
+            drawerShuffleEnabled = drawerShuffleEnabled
+        )
+        if (!result.isValid) {
+            throw IllegalStateException("Workspace invariant violation: ${result.errors.joinToString("; ")}")
         }
     }
 
@@ -2147,7 +3036,8 @@ class AppRepository(
     private fun serializeArchivedPlacement(
         activeItems: List<WorkspaceItemEntity>,
         activeMember: FolderMemberEntity?,
-        pageIdToIndex: Map<String, Int>
+        pageIdToIndex: Map<String, Int>,
+        folderHomeItem: WorkspaceItemEntity? = null
     ): String {
         val root = JSONObject()
         val itemsArr = JSONArray()
@@ -2173,6 +3063,11 @@ class AppRepository(
                     put("rank", activeMember.rank)
                     put("isFixed", activeMember.isFixed)
                     put("isShuffled", activeMember.isShuffled)
+                    if (folderHomeItem != null) {
+                        put("fallbackPageId", folderHomeItem.pageId ?: JSONObject.NULL)
+                        put("fallbackPageIndex", folderHomeItem.pageId?.let { pageIdToIndex[it] } ?: 0)
+                        put("fallbackRank", folderHomeItem.rank)
+                    }
                 }
             )
         }
@@ -2185,6 +3080,7 @@ class AppRepository(
         act: String,
         pages: List<WorkspacePageEntity>,
         validFolderIds: Set<String>,
+        existingItems: List<WorkspaceItemEntity>,
         existingMembers: List<FolderMemberEntity>,
         currentDockSize: Int,
         maxDockCount: Int,
@@ -2195,30 +3091,44 @@ class AppRepository(
     ): Boolean {
         return runCatching {
             val root = JSONObject(archivedJson)
+            var restoredToFolder = false
+            var fallbackFolderHomeObj: JSONObject? = null
+
             if (root.has("folderMember") && !root.isNull("folderMember")) {
                 val fm = root.getJSONObject("folderMember")
                 val fId = fm.getString("folderId")
                 if (fId in validFolderIds) {
-                    val existingRanks = existingMembers.filter { it.folderId == fId }.map { it.rank }.toSet()
-                    var rank = fm.optInt("rank", 0).coerceAtLeast(0)
-                    while (rank in existingRanks) rank++
-                    onRestoreMember(
-                        FolderMemberEntity(
-                            folderId = fId,
-                            packageName = pkg,
-                            activityName = act,
-                            rank = rank,
-                            isFixed = fm.optBoolean("isFixed", false),
-                            isShuffled = fm.optBoolean("isShuffled", false)
+                    val alreadyMember = existingMembers.any {
+                        it.packageName == pkg && it.activityName == act
+                    }
+                    if (!alreadyMember) {
+                        val existingRanks = existingMembers.filter { it.folderId == fId }.map { it.rank }.toSet()
+                        var rank = fm.optInt("rank", existingRanks.size).coerceIn(0, existingRanks.size)
+                        while (rank in existingRanks) rank++
+                        val memberFixed = fm.optBoolean("isFixed", false)
+                        onRestoreMember(
+                            FolderMemberEntity(
+                                folderId = fId,
+                                packageName = pkg,
+                                activityName = act,
+                                rank = rank,
+                                isFixed = memberFixed,
+                                isShuffled = !memberFixed && fm.optBoolean("isShuffled", false)
+                            )
                         )
-                    )
-                    return@runCatching true
+                    }
+                    restoredToFolder = true
+                } else {
+                    fallbackFolderHomeObj = fm
                 }
             }
 
             val itemsArr = root.optJSONArray("items") ?: JSONArray()
             val pagesById = pages.associateBy { it.pageId }
             val pagesByIndex = pages.associateBy { it.pageIndex }
+            var localDockSize = currentDockSize
+            var restoredHome = false
+            var restoredDockHidden = false
 
             for (i in 0 until itemsArr.length()) {
                 val obj = itemsArr.getJSONObject(i)
@@ -2227,25 +3137,74 @@ class AppRepository(
                 val isShuffled = obj.optBoolean("isShuffled", false) && !isFixed
                 val isHidden = obj.optBoolean("isHidden", false)
 
-                if (container == WorkspaceContainers.DOCK && currentDockSize < maxDockCount) {
-                    onRestoreItem(
-                        WorkspaceItemEntity(
-                            itemId = dockItemId(pkg, act),
-                            itemType = WorkspaceItemTypes.APP,
-                            containerType = WorkspaceContainers.DOCK,
-                            pageId = null,
-                            packageName = pkg,
-                            activityName = act,
-                            rank = allocateDockRank(obj.optInt("rank", currentDockSize)),
-                            isFixed = isFixed,
-                            isShuffled = isShuffled,
-                            isHidden = isHidden
+                if (container == WorkspaceContainers.DOCK) {
+                    val alreadyDock = existingItems.any {
+                        it.containerType == WorkspaceContainers.DOCK &&
+                            it.packageName == pkg &&
+                            it.activityName == act
+                    }
+                    if (!alreadyDock && localDockSize < maxDockCount) {
+                        onRestoreItem(
+                            WorkspaceItemEntity(
+                                itemId = dockItemId(pkg, act),
+                                itemType = WorkspaceItemTypes.APP,
+                                containerType = WorkspaceContainers.DOCK,
+                                pageId = null,
+                                packageName = pkg,
+                                activityName = act,
+                                rank = allocateDockRank(obj.optInt("rank", localDockSize)),
+                                isFixed = isFixed,
+                                isShuffled = isShuffled,
+                                isHidden = isHidden
+                            )
                         )
-                    )
-                } else {
-                    val savedPageId = obj.optString("pageId", "").takeIf { it.isNotBlank() && it in pagesById }
-                    val fallbackIndex = obj.optInt("pageIndex", 0).coerceIn(0, pages.size - 1)
+                        localDockSize++
+                        restoredDockHidden = isHidden
+                    }
+                } else if (container == WorkspaceContainers.HOME && !restoredToFolder && !restoredHome) {
+                    val alreadyHome = existingItems.any {
+                        it.containerType == WorkspaceContainers.HOME &&
+                            it.packageName == pkg &&
+                            it.activityName == act
+                    }
+                    if (!alreadyHome) {
+                        val savedPageId = obj.optString("pageId", "").takeIf { it.isNotBlank() && it in pagesById }
+                        val fallbackIndex = obj.optInt("pageIndex", 0).coerceIn(0, pages.size - 1)
+                        val targetPageId = savedPageId ?: (pagesByIndex[fallbackIndex]?.pageId ?: pages.first().pageId)
+                        onRestoreItem(
+                            WorkspaceItemEntity(
+                                itemId = homeItemId(pkg, act),
+                                itemType = WorkspaceItemTypes.APP,
+                                containerType = WorkspaceContainers.HOME,
+                                pageId = targetPageId,
+                                packageName = pkg,
+                                activityName = act,
+                                rank = allocateHomeRank(targetPageId, obj.optInt("rank", 0)),
+                                isFixed = isFixed,
+                                isShuffled = isShuffled,
+                                isHidden = isHidden
+                            )
+                        )
+                        restoredHome = true
+                    }
+                }
+            }
+
+            // Original folder no longer exists: restore former folder member safely to HOME
+            if (!restoredToFolder && !restoredHome && fallbackFolderHomeObj != null) {
+                val alreadyHome = existingItems.any {
+                    it.containerType == WorkspaceContainers.HOME &&
+                        it.packageName == pkg &&
+                        it.activityName == act
+                }
+                if (!alreadyHome) {
+                    val savedPageId = fallbackFolderHomeObj.optString("fallbackPageId", "")
+                        .takeIf { it.isNotBlank() && it in pagesById }
+                    val fallbackIndex = fallbackFolderHomeObj.optInt("fallbackPageIndex", 0).coerceIn(0, pages.size - 1)
                     val targetPageId = savedPageId ?: (pagesByIndex[fallbackIndex]?.pageId ?: pages.first().pageId)
+                    val preferredRank = fallbackFolderHomeObj.optInt("fallbackRank", 0).coerceAtLeast(0)
+                    val isFixed = fallbackFolderHomeObj.optBoolean("isFixed", false)
+                    val isShuffled = !isFixed && fallbackFolderHomeObj.optBoolean("isShuffled", false)
                     onRestoreItem(
                         WorkspaceItemEntity(
                             itemId = homeItemId(pkg, act),
@@ -2254,10 +3213,10 @@ class AppRepository(
                             pageId = targetPageId,
                             packageName = pkg,
                             activityName = act,
-                            rank = allocateHomeRank(targetPageId, obj.optInt("rank", 0)),
+                            rank = allocateHomeRank(targetPageId, preferredRank),
                             isFixed = isFixed,
                             isShuffled = isShuffled,
-                            isHidden = isHidden
+                            isHidden = restoredDockHidden
                         )
                     )
                 }
@@ -2267,6 +3226,27 @@ class AppRepository(
     }
 
     companion object {
+        const val MAX_FOLDER_NAME_LENGTH = 32
+        const val DEFAULT_FOLDER_NAME = "Folder"
+
+        fun normalizeAndValidateFolderName(rawName: String): Result<String> {
+            val trimmed = rawName.trim()
+            if (trimmed.isEmpty()) {
+                return Result.failure(IllegalArgumentException("Folder name cannot be empty"))
+            }
+            if (trimmed.length > MAX_FOLDER_NAME_LENGTH) {
+                return Result.failure(
+                    IllegalArgumentException("Folder name cannot exceed $MAX_FOLDER_NAME_LENGTH characters")
+                )
+            }
+            return Result.success(trimmed)
+        }
+
+        fun normalizeFolderNameOrDefault(rawName: String): String {
+            val trimmed = rawName.trim()
+            return if (trimmed.isEmpty()) DEFAULT_FOLDER_NAME else trimmed.take(MAX_FOLDER_NAME_LENGTH)
+        }
+
         fun homeItemId(packageName: String, activityName: String): String =
             "home_${packageName}_${activityName}"
 
@@ -2334,7 +3314,8 @@ class AppRepository(
                     dockRank = dockItem?.rank ?: -1,
                     homeItemId = homeItem?.itemId,
                     dockItemId = dockItem?.itemId,
-                    isInstalled = app.isInstalled
+                    isInstalled = app.isInstalled,
+                    folderRank = if (folderId != null) (member?.rank ?: -1) else -1
                 )
             }
         }

@@ -266,12 +266,15 @@ class HomeDockIndependenceTest {
         repository.toggleAppPinnedToDock("com.alpha", "com.alpha.Main", true) // dockRank 0
         repository.toggleAppPinnedToDock("com.beta", "com.beta.Main", true)  // dockRank 1
 
-        // 1. createFolder includes com.alpha -> removes HOME item, preserves DOCK item
+        // 1. createFolder includes com.alpha + com.gamma -> removes HOME items, preserves DOCK item
         val folderId = repository.createFolder(
             name = "Social",
             pageIndex = 0,
             slotIndex = 0,
-            components = listOf("com.alpha" to "com.alpha.Main")
+            components = listOf(
+                "com.alpha" to "com.alpha.Main",
+                "com.gamma" to "com.gamma.Main"
+            )
         )
         assertNormalizedWorkspaceValid()
 
@@ -293,7 +296,7 @@ class HomeDockIndependenceTest {
         assertTrue(betaInFolder.isPinnedToDock)
         assertEquals(1, betaInFolder.dockRank)
 
-        // 3. removeAppFromFolder for com.alpha -> restores HOME item, preserves DOCK item
+        // 3. removeAppFromFolder for com.alpha -> restores HOME item, folder retains 2 members, preserves DOCK item
         repository.removeAppFromFolder("com.alpha", "com.alpha.Main", targetPage = 1)
         assertNormalizedWorkspaceValid()
 
@@ -304,7 +307,7 @@ class HomeDockIndependenceTest {
         assertTrue(alphaRemoved.isPinnedToDock)
         assertEquals(0, alphaRemoved.dockRank)
 
-        // 4. deleteFolder -> unpacks com.beta to HOME, preserves DOCK item
+        // 4. deleteFolder -> unpacks com.beta and com.gamma to HOME, preserves DOCK item
         repository.deleteFolder(folderId)
         assertNormalizedWorkspaceValid()
 
@@ -360,7 +363,10 @@ class HomeDockIndependenceTest {
             name = "Tools",
             pageIndex = 0,
             slotIndex = 3,
-            components = listOf("com.beta" to "com.beta.Main")
+            components = listOf(
+                "com.beta" to "com.beta.Main",
+                "com.gamma" to "com.gamma.Main"
+            )
         )
 
         val backupJson = backupRestoreHelper.generateBackupJson()
@@ -369,7 +375,7 @@ class HomeDockIndependenceTest {
         db.workspaceDao().deleteAllFolderMembers()
         db.workspaceDao().deleteAllWorkspaceItems()
         db.workspaceDao().deleteAllFolders()
-        repository.addAppToHomeScreen("com.gamma", "com.gamma.Main", pageIndex = 0)
+        repository.addAppToHomeScreen("com.suite", "com.suite.Primary", pageIndex = 0)
 
         val restoreResult = backupRestoreHelper.restoreBackup(backupJson)
         assertTrue("Restore failed: ${restoreResult.exceptionOrNull()}", restoreResult.isSuccess)
@@ -390,6 +396,10 @@ class HomeDockIndependenceTest {
         assertFalse(beta.isOnHomeScreen)
         assertTrue(beta.isPinnedToDock)
         assertEquals(1, beta.dockRank)
+
+        val gamma = restored["com.gamma/com.gamma.Main"]!!
+        assertEquals(folderId, gamma.folderId)
+        assertFalse(gamma.isOnHomeScreen)
     }
 
     @Test

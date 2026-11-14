@@ -177,6 +177,7 @@ class BackupIntegrityStage3Test {
             listOf(
                 appEntity("com.v1.alpha", "com.v1.alpha.Main", "Alpha"),
                 appEntity("com.v1.beta", "com.v1.beta.Main", "Beta"),
+                appEntity("com.v1.beta2", "com.v1.beta2.Main", "Beta2"),
                 appEntity("com.v1.dock", "com.v1.dock.Main", "Dock")
             )
         )
@@ -245,6 +246,25 @@ class BackupIntegrityStage3Test {
                             put("isEssentialInFocus", false)
                             put("isHidden", true)
                             put("drawerSlotIndex", 1)
+                            put("isDrawerShuffled", false)
+                        }
+                    )
+                    put(
+                        JSONObject().apply {
+                            put("packageName", "com.v1.beta2")
+                            put("activityName", "com.v1.beta2.Main")
+                            put("label", "Beta2")
+                            put("isShuffled", false)
+                            put("isFixed", false)
+                            put("slotIndex", 1)
+                            put("pageIndex", 1)
+                            put("folderId", "v1_folder")
+                            put("isPinnedToDock", false)
+                            put("isOnHomeScreen", false)
+                            put("isVisibleInFocus", false)
+                            put("isEssentialInFocus", false)
+                            put("isHidden", false)
+                            put("drawerSlotIndex", 2)
                             put("isDrawerShuffled", false)
                         }
                     )
@@ -554,7 +574,7 @@ class BackupIntegrityStage3Test {
     fun `10_rejects missing folder references and orphan unplaced folders without mutating workspace`() = runBlocking {
         seedPages(1)
         db.workspaceDao().upsertFolder(FolderEntity("existing_f", "Existing"))
-        db.installedAppDao().upsertApps(listOf(appEntity("com.a"), appEntity("com.b")))
+        db.installedAppDao().upsertApps(listOf(appEntity("com.a"), appEntity("com.b"), appEntity("com.c")))
         db.workspaceDao().upsertWorkspaceItems(
             listOf(
                 WorkspaceItemEntity("f_item", WorkspaceItemTypes.FOLDER, WorkspaceContainers.HOME, "page_0", folderId = "existing_f", rank = 0),
@@ -562,7 +582,10 @@ class BackupIntegrityStage3Test {
             )
         )
         db.workspaceDao().upsertFolderMembers(
-            listOf(FolderMemberEntity("existing_f", "com.b", "com.b.MainActivity", rank = 0))
+            listOf(
+                FolderMemberEntity("existing_f", "com.b", "com.b.MainActivity", rank = 0),
+                FolderMemberEntity("existing_f", "com.c", "com.c.MainActivity", rank = 1)
+            )
         )
         val base = JSONObject(helper.generateBackupJson())
 

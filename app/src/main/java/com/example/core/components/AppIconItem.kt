@@ -24,6 +24,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
@@ -51,23 +52,47 @@ fun AppIconItem(
     iconSize: Dp = 54.dp,
     showLabel: Boolean = true,
     isShuffling: Boolean = false,
-    blurLevel: BlurLevel = BlurLevel.DISABLED
+    blurLevel: BlurLevel = BlurLevel.DISABLED,
+    enableBuiltInClick: Boolean = true,
+    isDraggedSource: Boolean = false,
+    isDragPreview: Boolean = false
 ) {
     val scale by animateFloatAsState(
-        targetValue = if (isShuffling && app.isShuffled) 0.88f else 1f,
+        targetValue = when {
+            isDragPreview -> 1.08f
+            isShuffling && app.isShuffled -> 0.88f
+            else -> 1f
+        },
         animationSpec = spring(dampingRatio = 0.6f, stiffness = 400f),
         label = "icon_scale"
     )
+    val contentAlpha by animateFloatAsState(
+        targetValue = if (isDraggedSource) 0.25f else 1f,
+        animationSpec = spring(stiffness = 500f),
+        label = "icon_drag_alpha"
+    )
+
+    val interactiveModifier = if (enableBuiltInClick) {
+        Modifier.combinedClickable(
+            onClick = onClick,
+            onLongClick = onLongClick
+        )
+    } else {
+        Modifier
+    }
+    val tagModifier = if (isDragPreview) {
+        Modifier
+    } else {
+        Modifier.testTag("app_item_${app.componentKey}")
+    }
 
     Column(
         modifier = modifier
             .scale(scale)
-            .combinedClickable(
-                onClick = onClick,
-                onLongClick = onLongClick
-            )
+            .alpha(contentAlpha)
+            .then(interactiveModifier)
             .padding(vertical = 6.dp, horizontal = 4.dp)
-            .testTag("app_item_${app.componentKey}"),
+            .then(tagModifier),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         val blurModifier = if (blurLevel != BlurLevel.DISABLED && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {

@@ -26,7 +26,8 @@ data class AppItem(
     val dockRank: Int = -1,
     val homeItemId: String? = null,
     val dockItemId: String? = null,
-    val isInstalled: Boolean = true
+    val isInstalled: Boolean = true,
+    val folderRank: Int = -1
 ) {
     val componentKey: String
         get() = "$packageName/$activityName"
